@@ -57,7 +57,8 @@ try {
     Remove-Item Env:FAILOVER_IMAGEGEN_APP_SMOKE, Env:FAILOVER_IMAGEGEN_APP_SELFTEST, Env:FAILOVER_IMAGEGEN_CHILD_OUT -ErrorAction SilentlyContinue
     $portFile = Join-Path $testRoot 'mock-port.txt'
     $mockScript = Join-Path $PSScriptRoot 'mock_server.py'
-    $mockProcess = Start-Process -FilePath $pythonPath -ArgumentList @('-B', ('"' + $mockScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden
+    $mockProcess = Start-Process -FilePath $pythonPath -ArgumentList @('-B', ('"' + $mockScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $evidence 'mock-server-stdout.txt') -RedirectStandardError (Join-Path $evidence 'mock-server-stderr.txt')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     while (!(Test-Path -LiteralPath $portFile) -and [DateTime]::UtcNow -lt $deadline) {
         if ($mockProcess.HasExited) { throw 'Local mock server exited before becoming ready' }
@@ -65,7 +66,7 @@ try {
     }
     if (!(Test-Path -LiteralPath $portFile)) { throw 'Local mock server startup timed out' }
     $port = (Get-Content -LiteralPath $portFile -Raw).Trim()
-    if ($port -notmatch '^\d+$') { throw 'Local mock server returned invalid port' }
+    if ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535) { throw 'Local mock server returned invalid port' }
     # JPEG uses the built-in PowerShell/GDI+ decoder. Neither system directory
     # contains Python; the controller keeps its previously resolved absolute path.
     $env:PATH = (Join-Path $env:SystemRoot 'System32') + ';' + (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')

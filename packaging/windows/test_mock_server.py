@@ -15,6 +15,41 @@ import image_decode
 
 
 class SmokeRelayTests(unittest.TestCase):
+    def test_ready_port_is_never_visible_before_its_contents(self):
+        # Widen the real open-before-write window without changing HTTP logic.
+        # A consumer must never see an empty ready file and fall back to port 80.
+        wrapper = r'''
+from pathlib import Path
+import runpy, sys, time
+script, port, observed = sys.argv[1:]
+original = Path.write_text
+def delayed(self, data, *args, **kwargs):
+    if self == Path(port):
+        with self.open('w', encoding='ascii') as output:
+            original(Path(observed), 'empty port file visible', encoding='ascii')
+            time.sleep(2)
+            return output.write(data)
+    return original(self, data, *args, **kwargs)
+Path.write_text = delayed
+sys.argv = [script, port]
+runpy.run_path(script, run_name='__main__')
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            port, observed = Path(directory) / 'port', Path(directory) / 'observed'
+            process = subprocess.Popen([sys.executable, '-B', '-c', wrapper,
+                str(Path(__file__).with_name('mock_server.py')), str(port), str(observed)])
+            try:
+                deadline = time.monotonic() + 10
+                while not (port.exists() or observed.exists()) and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(port.exists(), 'mock server failed to publish ready port')
+                self.assertRegex(port.read_text(encoding='ascii'), r'^[0-9]+$',
+                                 'An empty ready file can route the test to default HTTP port 80')
+                self.assertFalse(observed.exists(), 'ready port was opened before its contents were complete')
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_distinct_valid_and_truncated_fixtures_and_request_audit(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -28,7 +63,10 @@ class SmokeRelayTests(unittest.TestCase):
         while not port_file.exists() and process.poll() is None and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertTrue(port_file.exists(), 'mock server failed to start')
-        base = 'http://127.0.0.1:' + port_file.read_text()
+        port = port_file.read_text(encoding='ascii').strip()
+        self.assertRegex(port, r'^[0-9]+$', 'mock ready port must not be empty or malformed')
+        self.assertTrue(1 <= int(port) <= 65535, 'mock port is outside TCP range')
+        base = 'http://127.0.0.1:' + port
         images = {}
         for mode in ('png', 'jpeg', 'truncated-png', 'truncated-jpeg'):
             request = urllib.request.Request(base + '/v1/images/generations',

@@ -19,14 +19,21 @@ class BuildTest(unittest.TestCase):
             process = subprocess.Popen([sys.executable, '-B', str(script), str(port_file)])
             try:
                 deadline = time.monotonic() + 10
-                while not port_file.exists() and time.monotonic() < deadline:
+                while not port_file.exists() and process.poll() is None and time.monotonic() < deadline:
                     time.sleep(.05)
-                self.assertTrue(port_file.exists(), 'mock server failed to start')
-                request = urllib.request.Request('http://127.0.0.1:' + port_file.read_text() + '/v1/images/generations',
+                self.assertTrue(port_file.exists(), 'mock server failed to start; exit=%r' % process.poll())
+                port = port_file.read_text(encoding='ascii').strip()
+                self.assertRegex(port, r'^[0-9]+$', 'mock ready port must not be empty or malformed')
+                self.assertTrue(1 <= int(port) <= 65535, 'mock port is outside TCP range')
+                request = urllib.request.Request('http://127.0.0.1:' + port + '/v1/images/generations',
                     data=json.dumps({'prompt': 'test', 'model': 'mock', 'size': '64x64'}).encode(),
                     headers={'Content-Type': 'application/json', 'Authorization': 'Bearer dummy'}, method='POST')
-                with urllib.request.urlopen(request, timeout=5) as response:
-                    self.assertTrue(json.load(response)['data'][0]['b64_json'])
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertTrue(json.load(response)['data'][0]['b64_json'])
+                except Exception as error:
+                    self.fail('Mock HTTP failed at %s; server exit=%r; %s: %s' %
+                              (request.full_url, process.poll(), type(error).__name__, error))
             finally:
                 process.terminate()
                 process.wait(timeout=5)

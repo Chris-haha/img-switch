@@ -28,6 +28,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             self.wfile.write(payload)
+            if self.command == 'POST':
+                print('Windows smoke relay: response status=%d bytes=%d' % (status, len(payload)), flush=True)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # Cancellation intentionally closes an in-flight request.
 
@@ -43,11 +45,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != '/v1/images/generations':
             self.send_json(404, {'error': {'message': 'unsupported smoke endpoint'}})
             return
-        request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        length = int(self.headers['Content-Length'])
+        print('Windows smoke relay: receiving request body bytes=%d' % length, flush=True)
+        request = json.loads(self.rfile.read(length))
         prompt = request.get('prompt', '')
         mode = prompt.removeprefix('windows-smoke:') if prompt.startswith('windows-smoke:') else 'png'
         with self.server.audit_lock:
             self.server.requests.append({'mode': mode, 'path': self.path, 'model': request.get('model')})
+        print('Windows smoke relay: request body received', flush=True)
         if mode == 'slow':
             self.server.stop_event.wait(120)
             mode = 'png'
@@ -76,7 +81,20 @@ def start_server():
     return server
 
 
+def publish_port(path, port):
+    """Publish readiness atomically; an empty file would imply HTTP port 80."""
+    pending = path.with_name(path.name + '.pending')
+    if path.exists() or pending.exists():
+        raise FileExistsError('Refusing to reuse an existing mock readiness file')
+    try:
+        pending.write_text(str(port), encoding='ascii')
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 if __name__ == '__main__':
     server = start_server()
-    Path(sys.argv[1]).write_text(str(server.server_port), encoding='ascii')
+    publish_port(Path(sys.argv[1]), server.server_port)
+    print('Windows smoke relay: listening on 127.0.0.1:%d' % server.server_port, flush=True)
     threading.Event().wait()
