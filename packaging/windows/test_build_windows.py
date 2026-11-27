@@ -68,7 +68,8 @@ class BuildTest(unittest.TestCase):
             expected = [int(part) for part in (version['NUMERIC_VERSION'] + '.' + version['BUILD_NUMBER']).split('.')]
             for prefix in ('File', 'Product'):
                 self.assertEqual([metadata[prefix + part + 'Part'] for part in ('Major', 'Minor', 'Build', 'Private')], expected)
-                self.assertEqual(metadata[prefix + 'Version'], version['VERSION'])
+                # Inno overwrites fixed-width, space-filled version resources.
+                self.assertEqual(metadata[prefix + 'Version'].rstrip(' '), version['VERSION'])
 
     def test_local_mock_server_returns_image(self):
         script = PATH.with_name('mock_server.py')
