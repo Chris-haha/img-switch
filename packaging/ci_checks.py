@@ -56,8 +56,20 @@ def run_tests(target, record):
                  'sys.argv = sys.argv[1:]; '
                  'sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0]))); '
                  'runpy.run_path(sys.argv[0], run_name="__main__")')
-    record['checks'] = [execute([sys.executable, '-B', '-u', '-c', bootstrap, name, '-v'], name)
-                        for name in names]
+    record['checks'] = []
+    failures = []
+    for name in names:
+        try:
+            entry = execute([sys.executable, '-B', '-u', '-c', bootstrap, name, '-v'], name)
+        except RuntimeError as error:
+            # Suites use independent fixtures. Finish collecting failures so a
+            # platform-specific assertion cannot hide later native checks.
+            entry = {'name': name, 'passed': False, 'error': str(error)}
+            failures.append(name)
+            print(str(error), flush=True)
+        record['checks'].append(entry)
+    if failures:
+        raise RuntimeError('Native regression checks failed: ' + ', '.join(failures))
     record['tests_passed'] = True
 
 

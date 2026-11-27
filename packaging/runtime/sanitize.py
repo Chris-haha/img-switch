@@ -118,6 +118,11 @@ def scrub_binaries(binaries, directory):
     directory.mkdir(parents=True, exist_ok=True)
     result = []
     for name, source, kind in binaries:
+        if kind == 'SYMLINK':
+            # A PyInstaller TOC link stores a bundle-relative target string,
+            # not an on-disk source. The target binary has its own BINARY entry.
+            result.append((name, source, kind))
+            continue
         filename = Path(name).name.lower()
         if sys.platform == 'darwin' and filename.endswith('.so'):
             subdir = directory / hashlib.sha256(name.encode('utf-8')).hexdigest()
@@ -149,6 +154,11 @@ def scrub_datas(datas, directory):
     directory.mkdir(parents=True, exist_ok=True)
     result = []
     for name, source, kind in datas:
+        if kind == 'SYMLINK':
+            # Framework links are materialized later by PyInstaller. Preserve
+            # the metadata; the completed tree still gets the full ZIP audit.
+            result.append((name, source, kind))
+            continue
         if Path(name).suffix.lower() == '.zip' or is_zip_payload(source):
             # The destination is package-relative; never print the build host's
             # absolute source path when reporting a rejected dependency.

@@ -13,6 +13,20 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 class SanitizeTests(unittest.TestCase):
+    def test_framework_symlink_metadata_is_preserved_without_opening_its_target(self):
+        entries = [('Python', 'Python.framework/Versions/3.12/Python', 'SYMLINK'),
+                   ('Python.framework/Versions/Current', '3.12', 'SYMLINK')]
+        with tempfile.TemporaryDirectory() as directory:
+            for scrub in (module.scrub_binaries, module.scrub_datas):
+                with self.subTest(scrub=scrub.__name__):
+                    self.assertEqual(scrub(entries, Path(directory) / scrub.__name__), entries)
+
+    def test_missing_regular_runtime_data_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                module.scrub_datas([('missing.pyc', str(Path(directory) / 'missing.pyc'), 'DATA')],
+                                   Path(directory) / 'copy')
+
     def test_only_cpython_documentation_example_is_removed_without_size_change(self):
         line = b"        splitroot('C:/Users/test-user') == ('C:', '/', 'Users/test-user')\n"
         data = b'before\x00\n' + line + b'\x00after'

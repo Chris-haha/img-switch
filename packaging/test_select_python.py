@@ -88,7 +88,7 @@ class SelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Tk initialization failed'):
                 selector.probe_python(Path('/existing/python3'))
         args, options = run.call_args
-        self.assertEqual(args[0][:2], ['/existing/python3', '-B'])
+        self.assertEqual(args[0][:2], [str(Path('/existing/python3')), '-B'])
         self.assertEqual(options['env']['PYTHONDONTWRITEBYTECODE'], '1')
         self.assertNotIn('shell', options)
 
