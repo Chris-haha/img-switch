@@ -18,10 +18,13 @@ sources 数组顺序即故障切换优先级：排在前的先用；
 源内 models 数组顺序即站内模型级联顺序（前面的模型失败先换本站下一个模型）。
 """
 import json
+import hashlib
+import contextlib
 import os
 import re
 import ssl
 import sys
+import tempfile
 import urllib.parse
 
 CONFIG_ENV = "FAILOVER_IMAGEGEN_TOOL_CONFIG"
@@ -84,7 +87,61 @@ def config_path():
 
 
 def default_config():
-    return {"version": 1, "sources": []}
+    cfg = Config({"version": 1, "sources": []})
+    cfg.revision = None  # The reader observed that no file existed yet.
+    return cfg
+
+
+class Config(dict):
+    """A loaded document carries its revision without serializing it to JSON."""
+
+
+def atomic_write(path, data):
+    """Replace a file using a private, unique temporary file in its directory."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".img-switch-", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def config_lock(path):
+    """Serialize cooperating writers; OS locks are released after crashes."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
+    fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(lock.fileno()).st_size == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                raise RuntimeError("配置正在被其他进程保存，请稍后重试；原文件未改动") from None
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise RuntimeError("配置正在被其他进程保存，请稍后重试；原文件未改动") from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def load_config(path=None):
@@ -93,8 +150,9 @@ def load_config(path=None):
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read()
+        cfg = json.loads(raw)
     except (OSError, ValueError) as e:
         raise RuntimeError("配置文件解析失败 %s: %s" % (path, e))
     if not isinstance(cfg, dict) or not isinstance(cfg.get("sources"), list):
@@ -103,32 +161,61 @@ def load_config(path=None):
         )
     for i, src in enumerate(cfg["sources"]):
         _check_source(src, "sources[%d]" % i)
-    return cfg
+    names = [s["name"] for s in cfg["sources"]]
+    if len(names) != len(set(names)):
+        raise RuntimeError("配置中存在同名中转源，请先修复配置；原文件已保留")
+    loaded = Config(cfg)
+    loaded.revision = hashlib.sha256(raw).hexdigest()
+    return loaded
 
 
 def save_config(cfg, path=None):
-    """原子写入配置（先写临时文件再替换）。"""
+    """Reject corrupt/stale documents, retain the last valid file, then replace."""
     path = path or config_path()
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    with config_lock(path):
+        _save_config_locked(cfg, path)
+
+
+def _save_config_locked(cfg, path):
+    current = load_config(path)  # Never replace an unreadable configuration.
+    if hasattr(cfg, "revision") and cfg.revision != (current.revision if current is not None else None):
+        raise RuntimeError("配置已被其他窗口修改，请重新打开后再保存；原文件已保留")
+    data = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if current is not None:
+        with open(path, "rb") as f:
+            previous = f.read()
+        if hashlib.sha256(previous).hexdigest() != current.revision:
+            raise RuntimeError("配置在保存前发生变化，请重新打开后再保存")
+        atomic_write(path + ".backup", previous)
+    atomic_write(path, data)
+    if hasattr(cfg, "revision"):
+        cfg.revision = hashlib.sha256(data).hexdigest()
 
 
 def _check_source(src, where):
     if not isinstance(src, dict):
         raise RuntimeError("%s 不是对象" % where)
     for key in ("name", "base_url", "api_key"):
-        if not str(src.get(key) or "").strip():
-            raise RuntimeError("%s 缺少必填字段 %s" % (where, key))
+        if not isinstance(src.get(key), str) or not src[key].strip():
+            raise RuntimeError("%s.%s 必须为非空字符串" % (where, key))
     if not source_models(src):
         raise RuntimeError("%s 需要至少配置一个模型（model 或 models）" % where)
     if "://" not in src["base_url"]:
         raise RuntimeError("%s.base_url 需要是完整的 http(s) 地址" % where)
+    for field in ("supported_sizes", "supported_models"):
+        if field not in src:
+            continue
+        values = src[field]
+        if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values):
+            raise RuntimeError("%s.%s 必须是非空字符串列表" % (where, field))
+        if field == "supported_sizes":
+            aliases = {"2k", "2k-landscape", "4k", "4k-landscape", "2k-portrait", "4k-portrait", "square", "2k-square"}
+            for value in values:
+                if value.strip().lower() in aliases:
+                    continue
+                match = re.fullmatch(r"(\d{2,5})\s*[x×*]\s*(\d{2,5})", value.strip().lower())
+                if not match or any(int(n) < 64 for n in match.groups()):
+                    raise RuntimeError("%s.supported_sizes 需要尺寸别名或至少 64×64 的宽高" % where)
 
 
 def source_models(src):
@@ -220,12 +307,52 @@ def mask_key(key):
     return key[:5] + "****" + key[-2:]
 
 
-def mask_secrets(text):
-    """把文本里疑似密钥的部分打码，用于日志/错误消息脱敏。"""
+def mask_secrets(text, secrets=()):
+    """Remove configured credentials before truncating or displaying any text."""
     out = str(text)
+    if isinstance(secrets, str):
+        secrets = (secrets,)
+    variants = set()
+    for secret in secrets or ():
+        if not isinstance(secret, str) or not secret:
+            continue
+        variants.update((value, False) for value in (
+            secret, json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1]))
+        variants.add((secret, True))
+    if variants:
+        # One pass prevents short secrets from matching the replacement marker.
+        patterns = []
+        for value, encoded in sorted(variants, key=lambda entry: len(entry[0]), reverse=True):
+            pattern = re.escape(value)
+            if encoded:
+                # URL encoders may escape even unreserved characters, or mix
+                # literals and escapes. Only escape hex digits ignore case.
+                parts = []
+                for char in value:
+                    escaped = ''.join('%%%02X' % byte for byte in char.encode('utf-8'))
+                    forms = [re.escape(char), '(?i:' + escaped + ')']
+                    if char == ' ':
+                        forms.append(r'\+')
+                    parts.append('(?:' + '|'.join(forms) + ')')
+                pattern = ''.join(parts)
+            patterns.append(pattern)
+        pattern = "|".join(patterns)
+        out = re.sub(pattern, "<redacted>", out)
     for pat in SECRET_PATTERNS:
         out = pat.sub(lambda m: m.group(0)[:5] + "****", out)
     return out
+
+
+def redact_data(value, secrets=()):
+    """Return a sanitized copy suitable for a persisted task or diagnostic record."""
+    if isinstance(value, str):
+        return mask_secrets(value, secrets)
+    if isinstance(value, dict):
+        return {mask_secrets(key, secrets) if isinstance(key, str) else key:
+                redact_data(item, secrets) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_data(item, secrets) for item in value]
+    return value
 
 
 def endpoint_host(base_url):

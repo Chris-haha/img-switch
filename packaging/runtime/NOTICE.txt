@@ -8,3 +8,9 @@ placeholders; debug symbols are removed from macOS runtime libraries and
 extension modules. In the frozen macOS runtime, the VPATH build-tree setting is
 changed to "." to avoid distributing the original build directory. The original
 copyright and license notices for CPython are included alongside this notice.
+
+The copied _sysconfigdata bytecode replaces private interpreter-installation
+prefix constants with a marker. On import, its build_time_vars path strings
+resolve that marker to the frozen runtime directory (sys._MEIPASS, or
+sys.prefix outside a frozen runtime). Dictionary keys, value types and other
+configuration values are retained. The source interpreter is not modified.

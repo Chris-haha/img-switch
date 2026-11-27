@@ -27,20 +27,16 @@ class SanitizeTests(unittest.TestCase):
         data = b'/Users/test-user/private'
         self.assertEqual(module.remove_example(data), (data, 0))
 
-    def test_standard_library_zip_is_copied_and_scrubbed(self):
+    def test_loose_standard_library_bytecode_is_copied_and_scrubbed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            original = root / 'base_library.zip'
+            original = root / 'ntpath.pyc'
             line = b"        splitroot('C:/Users/test-user') == ('C:', '/', 'Users/test-user')\n"
-            with zipfile.ZipFile(original, 'w') as z:
-                z.writestr('ntpath.pyc', b'header\n' + line)
-                z.writestr('other', b'unchanged')
+            original.write_bytes(b'header\n' + line)
             before = original.read_bytes()
-            result = module.scrub_datas([('base_library.zip', str(original), 'DATA')], root / 'copy')
+            result = module.scrub_datas([('ntpath.pyc', str(original), 'DATA')], root / 'copy')
             self.assertEqual(original.read_bytes(), before)
-            with zipfile.ZipFile(result[0][1]) as z:
-                self.assertNotIn(b'/Users/', z.read('ntpath.pyc'))
-                self.assertEqual(z.read('other'), b'unchanged')
+            self.assertNotIn(b'/Users/', Path(result[0][1]).read_bytes())
 
     def test_unknown_spec_structure_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,7 +48,7 @@ class SanitizeTests(unittest.TestCase):
     def test_spec_scrubs_bootstrap_dependencies_before_exe(self):
         with tempfile.TemporaryDirectory() as tmp:
             spec = Path(tmp) / 'app.spec'
-            spec.write_text('pyz = PYZ(a.pure)\nexe = EXE(pyz)\n', encoding='utf-8')
+            spec.write_text('a = Analysis([], noarchive=True)\npyz = PYZ(a.pure)\nexe = EXE(pyz)\n', encoding='utf-8')
             module.patch_spec(spec, Path(tmp) / 'runtime')
             text = spec.read_text(encoding='utf-8')
             self.assertLess(text.index('pyz = PYZ(a.pure)'), text.index('pyz.dependencies ='))

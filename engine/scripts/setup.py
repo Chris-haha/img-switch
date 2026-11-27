@@ -16,6 +16,7 @@
 该文件包含 API Key，禁止上传或提交到仓库。
 """
 import argparse
+import copy
 import os
 import re
 import sys
@@ -139,6 +140,8 @@ def cmd_gui(_args):
             self.geometry("+%d+%d" % (max(0, (_sw - 980) // 2), max(0, (_sh - 640) // 2 - 20)))
             self.configure(bg=C["bg"])
             self.editing_index = None
+            self._editing_source = None
+            self._listed_sources = []
             self._layout = None
             self._build_style()
             self._build_header()
@@ -349,6 +352,7 @@ def cmd_gui(_args):
             if self.tree.selection():
                 self.tree.selection_remove(self.tree.selection())
             self.editing_index = None
+            self._editing_source = None
             self._clear_form()
             self._set_mode(False)
 
@@ -392,11 +396,33 @@ def cmd_gui(_args):
                 return _load_or_exit()
             except SystemExit as e:
                 messagebox.showerror("配置错误", str(e))
-                return failovercfg.default_config()
+                return None
+
+        def _save(self, cfg):
+            try:
+                failovercfg.save_config(cfg)
+                return True
+            except (RuntimeError, OSError) as error:
+                messagebox.showerror("无法保存", str(error))
+                self._set_status("保存失败，原配置已保留", "bad")
+                return False
+
+        def _row_is_current(self, cfg, idx):
+            if (cfg is None or idx >= len(cfg["sources"]) or idx >= len(self._listed_sources)
+                    or cfg["sources"][idx] != self._listed_sources[idx]):
+                messagebox.showerror("列表已变化", "配置已被其他窗口修改，请刷新后重新选择；未写入更改")
+                self.refresh()
+                return False
+            return True
 
         def refresh(self, keep=None):
             cfg = self._cfg()
             self.tree.delete(*self.tree.get_children())
+            if cfg is None:
+                self._listed_sources = []
+                self._set_status("配置无法读取，原文件已保留", "bad")
+                return
+            self._listed_sources = copy.deepcopy(cfg["sources"])
             for i, s in enumerate(cfg["sources"]):
                 on = s.get("enabled", True)
                 self.tree.insert("", "end", iid=str(i), tags=("on" if on else "off",),
@@ -434,10 +460,11 @@ def cmd_gui(_args):
             if idx is None:
                 return
             cfg = self._cfg()
-            if idx >= len(cfg["sources"]):
+            if not self._row_is_current(cfg, idx):
                 return
             self.editing_index = idx
             s = cfg["sources"][idx]
+            self._editing_source = copy.deepcopy(s)
             self.vars["name"].set(s["name"])
             self.vars["base_url"].set(s["base_url"])
             self.vars["api_key"].set(s["api_key"])
@@ -468,11 +495,14 @@ def cmd_gui(_args):
                 self._set_status("添加失败：%s" % e, "bad")
                 return
             cfg = self._cfg()
+            if cfg is None:
+                return
             if failovercfg.find_source(cfg, src["name"]):
                 messagebox.showerror("无法添加", "已存在同名源 %r" % src["name"])
                 return
             cfg["sources"].append(src)
-            failovercfg.save_config(cfg)
+            if not self._save(cfg):
+                return
             self._set_status("已添加「%s」并保存（优先级第 %d）。继续填写可加下一个源"
                              % (src["name"], len(cfg["sources"])))
             self.refresh()
@@ -489,12 +519,26 @@ def cmd_gui(_args):
                 messagebox.showerror("无法保存", str(e))
                 return
             cfg = self._cfg()
+            if cfg is None:
+                return
+            original = self._editing_source
+            idx = next((i for i, s in enumerate(cfg["sources"])
+                        if original and s["name"] == original["name"]), None)
+            if idx is None or cfg["sources"][idx] != original:
+                messagebox.showerror("无法保存", "正在编辑的源已被其他窗口修改或删除，请重新打开；未写入更改")
+                return
             for i, s in enumerate(cfg["sources"]):
                 if i != idx and s["name"] == src["name"]:
                     messagebox.showerror("无法保存", "已存在同名源「%s」" % src["name"])
                     return
-            cfg["sources"][idx] = src
-            failovercfg.save_config(cfg)
+            # Basic editing must preserve optional source capability limits.
+            merged = dict(cfg["sources"][idx])
+            for key in ("model", "models", "timeout"):
+                merged.pop(key, None)
+            merged.update(src)
+            cfg["sources"][idx] = merged
+            if not self._save(cfg):
+                return
             self._set_status("已更新「%s」并保存" % src["name"])
             self.refresh()
             self._to_add_mode()
@@ -504,10 +548,13 @@ def cmd_gui(_args):
             if idx is None:
                 return
             cfg = self._cfg()
+            if not self._row_is_current(cfg, idx):
+                return
             name = cfg["sources"][idx]["name"]
             if messagebox.askyesno("确认删除", "删除源「%s」？" % name):
                 del cfg["sources"][idx]
-                failovercfg.save_config(cfg)
+                if not self._save(cfg):
+                    return
                 self._set_status("已删除「%s」" % name)
                 self.refresh()
                 self._to_add_mode()
@@ -517,10 +564,13 @@ def cmd_gui(_args):
             if idx is None:
                 return
             cfg = self._cfg()
+            if not self._row_is_current(cfg, idx):
+                return
             j = idx + delta
             if 0 <= j < len(cfg["sources"]):
                 cfg["sources"][idx], cfg["sources"][j] = cfg["sources"][j], cfg["sources"][idx]
-                failovercfg.save_config(cfg)
+                if not self._save(cfg):
+                    return
                 self._set_status("已调整顺序，当前第 %d 位：%s" % (j + 1, cfg["sources"][j]["name"]))
                 self.refresh(keep=j)
 

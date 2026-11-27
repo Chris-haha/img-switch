@@ -7,6 +7,7 @@ path/identity patterns, not arbitrary secrets or third-party license compliance.
 import collections
 import getpass
 import io
+import importlib.util
 import marshal
 import os
 from pathlib import Path
@@ -115,7 +116,11 @@ class Scanner:
                 pyz_count += 1
                 self.pyz(payload)
             elif norm.endswith('.zip'):
-                self.zip(payload)
+                raise ValueError('ZIP payload is forbidden in noarchive builds')
+            elif norm.endswith('.pyc'):
+                if len(payload) < 16 or payload[:4] != importlib.util.MAGIC_NUMBER:
+                    raise ValueError('invalid or mismatched pyc header')
+                self.code(marshal.loads(payload[16:]))
             elif kind in (b's', b'm', b'M'):
                 self.code(marshal.loads(payload))
         if pyz_count != 1 or (is_gui and cli_count != 1):

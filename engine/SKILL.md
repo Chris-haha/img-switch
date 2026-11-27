@@ -1,6 +1,6 @@
 ---
 name: failover-imagegen-tool
-description: 通过 OpenAI 兼容中转站生成或编辑图片，多中转站×多模型两级级联故障切换（一个站/模型失败自动换下一个重试）。当用户要求生图、画图、AI 绘图、图像生成、图片编辑、出图、改图、批量生图，或提到中转站生图、查生图模型、源体检时使用。支持尺寸别名（2K/4K 横竖图方图）、批量生图、模型发现（--models）、源健康体检（--check），输出图片与可能包含敏感信息的 meta.json 到 generated/ 目录，API Key 保存在本机配置中。
+description: 通过 OpenAI 兼容中转站生成或编辑图片，多中转站×多模型两级级联故障切换（明确失败时切换，结果未知时停止重发）。当用户要求生图、画图、AI 绘图、图像生成、图片编辑、出图、改图、批量生图，或提到中转站生图、查生图模型、源体检时使用。支持尺寸别名（2K/4K 横竖图方图）、批量生图、模型发现（--models）、源健康体检（--check），输出图片与可能包含敏感信息的 meta.json 到 generated/ 目录，API Key 保存在本机配置中。
 ---
 
 # failover-imagegen-tool：中转站生图（多源×多模型级联）
@@ -10,9 +10,10 @@ description: 通过 OpenAI 兼容中转站生成或编辑图片，多中转站×
 
 | 失败类型 | 动作 |
 |---|---|
-| HTTP 404 / 5xx、响应无图 | 换本站下一个模型；本站模型用尽换下一站 |
-| 网络错误/超时、401/403/408/429、图片下载失败 | 换下一个中转站 |
-| HTTP 400/422 等其他 4xx | **立即停止**（请求不合法：模型/尺寸/提示词），不要靠重试绕过 |
+| HTTP 404、结构化明确模型/尺寸不支持 | 按兼容性尝试下个模型或来源，不偷偷改变用户尺寸 |
+| 发送前连接拒绝、401/403认证拒绝、429 | 换源；内容安全拒绝始终停止 |
+| HTTP 408/5xx、发送后超时/断连、已生成后的下载失败 | 记为 unknown，保留请求 ID；不得自动重发 |
+| 其他 4xx、本地解码环境不可用 | 停止并解释原因 |
 
 脚本位于本 skill 目录 `scripts/`（下文 `<skill_dir>` 即 SKILL.md 所在目录）。
 
@@ -60,14 +61,21 @@ python <skill_dir>/scripts/failover_imagegen_tool.py batch --prompts-file jobs.t
 
 `jobs.txt` 一行一条提示词（`#` 开头为注释）。逐张走完整级联，单张失败不停继续下一张，结束输出"成功 X / 失败 Y"汇总；退出码 0=全部成功、1=有失败。
 
-## 结果处理与排错
+## 任务查询、取消和恢复
 
-- 成功：读 `.meta.json` 汇报实际尺寸；`size_mismatch` 为 true 时说明以输出实际宽高为准。
-- 失败（退出码 1）：按 `attempts`（含每次的站/模型/错误）逐条汇报：
-  - 429/超时/5xx → 已自动换模型/换站；提醒超时发生在服务端受理后可能重复计费。
-  - 400/422（fatal，已停止）→ 查服务商文档确认模型 ID 与尺寸，勿反复重试。
-  - 批量部分失败 → 汇总表里给出每条失败原因，可修正后重跑。
-- 需要新增/调整源用 `setup.py` 子命令，不手工编辑或展示 config.json。
+```bash
+python <skill_dir>/scripts/failover_imagegen_tool.py history --json
+python <skill_dir>/scripts/failover_imagegen_tool.py cancel --task-id <任务ID>
+python <skill_dir>/scripts/failover_imagegen_tool.py retry --task-id <任务ID>
+```
+
+生成时保存任务 ID；`--deadline <秒>` 指定整项任务总时限（默认 600）。任务默认保存在配置旁的 `jobs/`，使用 `--jobs-dir` 时后续命令须指定同一目录。
+
+- 成功：按 `.meta.json` 汇报实际尺寸与图片路径，尺寸不一致要说明。
+- 失败：从任务详情解释原因，修正后仅重试未完成项；已成功项不会重复执行。
+- `unknown`：服务端可能已处理或计费。先向用户说明并让其核对请求 ID；未经明确同意不要使用 `--confirm-unknown`、新建同样任务或换源再次生成。用户确认后才运行 `retry --task-id <ID> --confirm-unknown`。
+- 取消：停止本地等待不代表撤销上游请求；已发出的请求保留未知状态。
+- 诊断中不要展示配置或密钥；即使已脱敏，提示词、图片和本机路径仍需按分享范围筛选。
 
 ## 安全红线
 

@@ -1,81 +1,107 @@
-name: Build unsigned test installers
+name: Native installer acceptance and verified release
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
-    branches:
-      - 'codex/**'
-    tags:
-      - 'v*'
+    branches: ['codex/release-*']
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: native-installers-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONUTF8: '1'
+
 jobs:
   source:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
     steps:
+      - name: Require Git transport before checkout
+        run: git --version
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Test and build source archive
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify source directory and release gates without archives
         run: |
-          python -B packaging/source/test_build_source.py
+          python3 -B test_packaging_nozip.py
+          python3 -B test_build_tools.py
+          python3 -B packaging/test_select_python.py
+          python3 -B packaging/test_ci_release.py
+          python3 -B packaging/source/test_build_source.py
           mkdir -p artifacts/source
-          python -B packaging/source/build_source.py --output artifacts/source/img-switch-source.zip
-          cd artifacts/source
-          sha256sum img-switch-source.zip > SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: img-switch-source-test
-          path: artifacts/source/*
-          if-no-files-found: error
+          python3 -B packaging/source/build_source.py --output artifacts/source/img-switch
+          python3 -B packaging/runtime/nozip.py artifacts/source
+      - name: Prepare private release draft after source checks
+        id: draft
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/release-')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B packaging/ci_release.py prepare
 
   windows:
+    needs: source
     runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      IMG_SWITCH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
+      - name: Require Git transport before checkout
+        run: git --version
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          architecture: x64
-      - name: Install build tools
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select existing native Python with working Tk
         shell: pwsh
         run: |
-          python -m pip install pyinstaller==6.16.0
+          $selected = python -B packaging/select_python.py --expected-arch x86_64
+          if ($LASTEXITCODE -ne 0) { throw 'No usable preinstalled native Python/Tk' }
+          "PYTHON=$selected" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $selected -B packaging/prepare_tools.py --target build/tools
+          if ($LASTEXITCODE -ne 0) { throw 'Build dependency preparation failed' }
+          "PYTHONPATH=$((Join-Path $PWD 'build/tools'))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $iscc = 'C:\Program Files (x86)\Inno Setup 6'
-          if (!(Test-Path "$iscc\ISCC.exe")) { throw 'Inno Setup 6 is not installed on this runner' }
+          if (!(Test-Path "$iscc\ISCC.exe")) { throw 'Preinstalled Inno Setup 6 is required' }
           $iscc | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Run isolated tests
-        run: |
-          python -B app_tests.py
-          python -B test_probe.py
-          python -B engine/tests/run_tests.py
-          python -B engine/tests/test_user_agent.py
-          python -B test_packaged_runtime.py
-          python -B engine/tests/test_url_privacy.py
-          python -B packaging/runtime/test_sanitize.py
-          python -B packaging/windows/test_build_windows.py
-          python -B packaging/windows/test_audit_privacy.py
-      - name: Build test installer
-        run: python packaging/windows/build_windows.py --version 0.1.0 --output artifacts/windows
-      - name: Install, test and uninstall in an isolated environment
+      - name: Native regression checks
         shell: pwsh
-        run: ./packaging/windows/smoke.ps1 -Installer artifacts/windows/IMG-Switch-0.1.0-Windows-x64-unsigned-setup.exe
-      - name: Record SHA-256
+        run: '& $env:PYTHON -B packaging/ci_checks.py tests --platform windows-x64 --record artifacts/windows-evidence.json'
+      - name: Build installer
+        shell: pwsh
+        run: '& $env:PYTHON -B packaging/windows/build_windows.py --output artifacts/windows'
+      - name: Actually install, exercise GUI and engine, and uninstall
         shell: pwsh
         run: |
-          $file = Get-Item artifacts/windows/*.exe
-          $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
-          "$hash  $($file.Name)" | Set-Content -Encoding ascii artifacts/windows/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: img-switch-windows-x64-unsigned-test
-          path: artifacts/windows/*
-          if-no-files-found: error
+          $version = & $env:PYTHON -B packaging/runtime/release_version.py --field VERSION
+          & $env:PYTHON -B packaging/ci_checks.py smoke --platform windows-x64 --record artifacts/windows-evidence.json --package "artifacts/windows/IMG-Switch-$version-Windows-x64-unsigned-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Native installer acceptance failed' }
+          & $env:PYTHON -B packaging/runtime/nozip.py artifacts/windows
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected archive in outputs' }
+      - name: Upload raw verified installer to private draft
+        if: needs.source.outputs.release_id != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.source.outputs.release_id }}
+        shell: pwsh
+        run: |
+          $version = & $env:PYTHON -B packaging/runtime/release_version.py --field VERSION
+          & $env:PYTHON -B packaging/ci_release.py upload --release-id $env:RELEASE_ID --platform windows-x64 --package "artifacts/windows/IMG-Switch-$version-Windows-x64-unsigned-setup.exe" --evidence artifacts/windows-evidence.json
 
   macos:
+    needs: source
     strategy:
       fail-fast: false
       matrix:
@@ -85,91 +111,64 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      IMG_SWITCH_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      IMG_SWITCH_EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
+      - name: Require Git transport before checkout
+        run: git --version
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - name: Install build tools
-        run: python3 -m pip install pyinstaller==6.22.3 pycdlib==1.22.0 certifi==2026.10.23
-      - name: Run isolated tests
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Select existing native Python with working Tk
         run: |
-          python3 -B app_tests.py
-          python3 -B test_probe.py
-          python3 -B engine/tests/run_tests.py
-          python3 -B engine/tests/test_user_agent.py
-          python3 -B test_packaged_runtime.py
-          python3 -B engine/tests/test_url_privacy.py
-          python3 -B packaging/runtime/test_sanitize.py
-          python3 -B packaging/macos/test_stage.py
-          python3 -B packaging/macos/test_certificates.py
-          python3 -B packaging/macos/test_audit_privacy.py
-          python3 -B packaging/macos/test_make_dmg.py
-      - name: Build test disk image
-        run: PYTHON=python3 bash packaging/macos/build.sh artifacts/macos
-      - name: Test disk image and standalone engine
+          selected="$(python3 -B packaging/select_python.py --expected-arch "$IMG_SWITCH_EXPECTED_ARCH")"
+          echo "PYTHON=$selected" >> "$GITHUB_ENV"
+          "$selected" -B packaging/prepare_tools.py --target build/tools
+          echo "PYTHONPATH=$PWD/build/tools" >> "$GITHUB_ENV"
+      - name: Native regression checks
+        run: '"$PYTHON" -B packaging/ci_checks.py tests --platform "macos-$IMG_SWITCH_EXPECTED_ARCH" --record artifacts/macos-evidence.json'
+      - name: Build disk image
+        run: bash packaging/macos/build.sh artifacts/macos
+      - name: Mount and exercise actual GUI and standalone engine
         shell: bash
         run: |
           set -euo pipefail
+          version="$("$PYTHON" -B packaging/runtime/release_version.py --field VERSION)"
           mountpoint="$RUNNER_TEMP/img-switch-test"
           mkdir -p "$mountpoint"
-          hdiutil attach -readonly -nobrowse -quiet -mountpoint "$mountpoint" "artifacts/macos/IMG-Switch-macOS-${{ matrix.arch }}-unsigned.dmg"
+          hdiutil attach -readonly -nobrowse -quiet -mountpoint "$mountpoint" "artifacts/macos/IMG-Switch-$version-macOS-$IMG_SWITCH_EXPECTED_ARCH-unsigned.dmg"
           trap 'hdiutil detach "$mountpoint" -quiet' EXIT
-          PYTHONDONTWRITEBYTECODE=1 python3 packaging/macos/smoke.py "$mountpoint/IMG Switch.app"
-          IMG_SWITCH_MACHO_DIAGNOSTICS=1 PYTHONDONTWRITEBYTECODE=1 python3 packaging/macos/audit_privacy.py "$mountpoint/IMG Switch.app"
-      - name: Record SHA-256
-        shell: bash
+          "$PYTHON" -B packaging/ci_checks.py smoke --platform "macos-$IMG_SWITCH_EXPECTED_ARCH" --record artifacts/macos-evidence.json --package "$mountpoint/IMG Switch.app"
+          IMG_SWITCH_MACHO_DIAGNOSTICS=1 "$PYTHON" -B packaging/macos/audit_privacy.py "$mountpoint/IMG Switch.app"
+          "$PYTHON" -B packaging/runtime/nozip.py artifacts/macos
+      - name: Upload raw verified installer to private draft
+        if: needs.source.outputs.release_id != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.source.outputs.release_id }}
         run: |
-          cd artifacts/macos
-          shasum -a 256 *.dmg > SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: img-switch-macos-${{ matrix.arch }}-unsigned-test
-          path: artifacts/macos/*
-          if-no-files-found: error
+          version="$("$PYTHON" -B packaging/runtime/release_version.py --field VERSION)"
+          "$PYTHON" -B packaging/ci_release.py upload --release-id "$RELEASE_ID" --platform "macos-$IMG_SWITCH_EXPECTED_ARCH" --package "artifacts/macos/IMG-Switch-$version-macOS-$IMG_SWITCH_EXPECTED_ARCH-unsigned.dmg" --evidence artifacts/macos-evidence.json
 
-  release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/release-')
     needs: [source, windows, macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Require Git transport before checkout
+        run: git --version
+      - uses: actions/checkout@v4
         with:
-          name: img-switch-source-test
-          path: artifacts/source
-      - uses: actions/download-artifact@v4
-        with:
-          name: img-switch-windows-x64-unsigned-test
-          path: artifacts/windows
-      - uses: actions/download-artifact@v4
-        with:
-          name: img-switch-macos-arm64-unsigned-test
-          path: artifacts/macos-arm64
-      - uses: actions/download-artifact@v4
-        with:
-          name: img-switch-macos-x86_64-unsigned-test
-          path: artifacts/macos-x86_64
-      - name: Assemble verified build outputs
-        shell: bash
-        run: |
-          set -euo pipefail
-          for dir in source windows macos-arm64 macos-x86_64; do
-            (cd "artifacts/$dir" && sha256sum --check SHA256SUMS.txt)
-          done
-          mkdir release-assets
-          cp artifacts/source/*.zip release-assets/
-          cp artifacts/windows/*.exe release-assets/
-          cp artifacts/macos-arm64/*.dmg release-assets/
-          cp artifacts/macos-x86_64/*.dmg release-assets/
-          test "$(find release-assets -type f | wc -l)" -eq 4
-          (cd release-assets && sha256sum * > SHA256SUMS.txt)
-      - name: Publish unsigned test release
+          persist-credentials: false
+      - name: Re-download raw binaries, verify all three manifests, then publish
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME" release-assets/*
-          --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease
-          --title "IMG Switch $GITHUB_REF_NAME (测试版)"
-          --notes "测试安装包尚未正式签名；macOS 版本尚未公证。使用前请核对平台和 SHA-256。"
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.source.outputs.release_id }}
+        run: python3 -B packaging/ci_release.py publish --release-id "$RELEASE_ID"

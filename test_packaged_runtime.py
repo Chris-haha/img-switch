@@ -22,6 +22,9 @@ class PackagedRuntimeTests(unittest.TestCase):
         self.engine = self.root / "bundle" / "engine"
         self.engine.mkdir(parents=True)
         shutil.copyfile(Path(app.__file__).parent / "engine" / "SKILL.md", self.engine / "SKILL.md")
+        (self.engine / "scripts").mkdir()
+        shutil.copyfile(Path(app.__file__).parent / "engine/scripts/failovercfg.py",
+                        self.engine / "scripts/failovercfg.py")
         binary = self.engine / "bin" / ("img-switch-engine.exe" if os.name == "nt" else "img-switch-engine")
         binary.parent.mkdir()
         binary.write_bytes(b"bundled-cli" if os.name == "nt" else b"#!/bin/sh\nprintf '%s\\n' \"$1\"\nexit 7\n")
@@ -95,6 +98,20 @@ class PackagedRuntimeTests(unittest.TestCase):
         self.assertIn('.codex', str(errors))
         self.assertEqual(binary.read_bytes(), b'old-version')
 
+    def test_startup_upgrade_keeps_codex_native_exclusion(self):
+        app.install_skill(['.codex'])
+        config = self.home / '.codex/config.toml'
+        with config.open('a') as f:
+            f.write('\n[[skills.config]]\nname = "failover-imagegen-tool"\nenabled = false\n')
+        original = config.read_bytes()
+        binary_name = 'img-switch-engine.exe' if os.name == 'nt' else 'img-switch-engine'
+        binary = self.home / '.codex/skills/failover-imagegen-tool/bin' / binary_name
+        binary.write_bytes(b'old-version')
+        self.assertFalse(app.host_hooked('.codex'))
+        self.assertEqual(app.sync_connected_skills(), [])
+        self.assertEqual(config.read_bytes(), original)
+        self.assertFalse(app.host_hooked('.codex'))
+
     def test_startup_does_not_reactivate_disabled_agent(self):
         app.install_skill(['.codex'])
         skill = self.home / '.codex' / 'skills' / app.SKILL_NAME
@@ -113,7 +130,8 @@ class PackagedRuntimeTests(unittest.TestCase):
         binary.write_bytes(b'old-version')
         bundle = self.root / 'application'
         bundle.mkdir()
-        shutil.copyfile(Path(app.__file__), bundle / 'app.py')
+        for filename in ('app.py', 'gui_tasks.py', 'version.py'):
+            shutil.copyfile(Path(app.__file__).parent / filename, bundle / filename)
         shutil.copytree(Path(app.__file__).parent / 'engine', bundle / 'engine')
         (bundle / 'engine' / 'bin').mkdir(exist_ok=True)
         shutil.copyfile(self.engine / 'bin' / binary_name, bundle / 'engine' / 'bin' / binary_name)

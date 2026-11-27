@@ -9,6 +9,7 @@ import app
 class ProbeTests(unittest.TestCase):
     def test_temporary_connection_failure_is_retried(self):
         response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"data":[{"id":"test-image"}]}'
         with mock.patch('app.urllib.request.urlopen', side_effect=[
                 urllib.error.URLError(ConnectionResetError('reset')), response]) as send, \
              mock.patch('app.time.sleep'):
@@ -26,6 +27,7 @@ class ProbeTests(unittest.TestCase):
 
     def test_forbidden_is_not_reported_as_bad_key_or_retried(self):
         error = urllib.error.HTTPError('https://example.com/v1/models', 403, 'Forbidden', {}, None)
+        self.addCleanup(error.close)
         with mock.patch('app.urllib.request.urlopen', side_effect=error) as send:
             label, detail, ok = app.probe_relay('https://example.com/v1', {})
         self.assertFalse(ok)

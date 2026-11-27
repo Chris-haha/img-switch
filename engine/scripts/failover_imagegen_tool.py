@@ -10,18 +10,29 @@
   python failover_imagegen_tool.py --list-sources
 
 故障切换规则（中转站优先级为外层，站内模型级联为内层）：
-  - 换本站下一个模型：HTTP 404/5xx、响应无图、返回内容不是图片
-  - 换下一个中转站：网络错误/超时、401/403/408/429、图片下载失败
-  - 致命（立即停止，不再尝试）：HTTP 400/422 等其他 4xx——请求本身不合法
-    （模型 ID/尺寸/提示词问题），换站换模型大概率同样失败，不要靠重试绕过
+  - 换本站下一个模型：HTTP 404、响应无图、返回内容不是图片
+  - 换下一个中转站：确定未发送的连接失败、401/403/429、明确不支持的尺寸
+  - 状态未知并停止：发送后超时/断连、408/5xx、图片下载失败；须核对上游后确认重试
+  - 致命（立即停止，不再尝试）：内容安全拒绝、未识别的 HTTP 4xx
+  - 明确且结构化的模型/尺寸不支持错误可换兼容候选，不自动改变请求尺寸
 
 输出：当前目录 generated/ 下 {name}-YYYYMMDD-HHMMSS-{尺寸标签}.png（或 .jpg）
       与同名 .meta.json（模型、尺寸、提示词快照、耗时、逐次尝试记录，分享前需检查敏感内容）。
 """
 import argparse
+import builtins
+import errno
+import multiprocessing
+import math
+import socket
+import signal
+import subprocess
+import ssl
 import base64
+import binascii
 import glob
 import json
+import http.client
 import os
 import re
 import sys
@@ -30,9 +41,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import failovercfg
+import task_store
+import image_decode
+
+_SECRETS = ()
+_REQUEST_EVENT = None
+
+
+def _safe(value, secrets=()):
+    return failovercfg.mask_secrets(value, tuple(_SECRETS) + tuple(secrets))
+
+
+def print(*values, **kwargs):
+    """Sanitize all command output, including names, prompts and provider text."""
+    return builtins.print(*[_safe(v) for v in values], **kwargs)
 
 # 尺寸别名（宽, 高）
 SIZE_ALIASES = {
@@ -48,7 +74,7 @@ SIZE_ALIASES = {
 DEFAULT_SIZE = (2560, 1440)
 
 # 这些 HTTP 状态视为「站点级故障/限制」：直接换下一个中转站
-FAILOVER_SOURCE_HTTP = {401, 403, 408, 429}
+FAILOVER_SOURCE_HTTP = {401, 403, 429}
 # 模型发现时的生图模型关键字（大小写不敏感）
 IMAGE_HINT = re.compile(
     r"image|dall|flux|midjourney|\bmj\b|stable|sdxl|sd3|seedream|ideogram|recraft"
@@ -56,15 +82,20 @@ IMAGE_HINT = re.compile(
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8"
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 
 
 class AttemptError(Exception):
-    """一次「站×模型」尝试失败。kind: fatal / next_model / next_source。"""
+    """一次「站×模型」尝试失败。kind: fatal / next_model / next_source / unknown。"""
 
-    def __init__(self, kind, message):
+    def __init__(self, kind, message, request_id=None, disable_source=False):
+        message = _safe(message)
         super().__init__(message)
         self.kind = kind
         self.message = message
+        self.request_id = request_id
+        self.disable_source = disable_source
 
 
 # ---------------------------------------------------------------- 尺寸与图片
@@ -99,11 +130,12 @@ def size_tag(w, h):
 
 
 def detect_image(data):
-    """校验字节流是 PNG/JPEG，返回 (ext, w, h)；不是图片返回 None。"""
-    if data[:8] == PNG_MAGIC and len(data) >= 24 and data[12:16] == b"IHDR":
-        w = int.from_bytes(data[16:20], "big")
-        h = int.from_bytes(data[20:24], "big")
-        return ("png", w, h)
+    """Check PNG CRC/data completeness or JPEG framing before declaring success."""
+    if not isinstance(data, bytes) or len(data) > MAX_IMAGE_BYTES:
+        return None
+    if data[:8] == PNG_MAGIC:
+        size = _png_size(data)
+        return ("png", *size) if size else None
     if data[:2] == JPEG_MAGIC:
         size = _jpeg_size(data)
         if size:
@@ -111,29 +143,177 @@ def detect_image(data):
     return None
 
 
+def _png_size(data):
+    offset, header, compressed, ended = 8, None, bytearray(), False
+    palette = False
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        kind = data[offset + 4:offset + 8]
+        end = offset + 12 + length
+        if end > len(data):
+            return None
+        payload = data[offset + 8:end - 4]
+        if zlib.crc32(kind + payload) & 0xffffffff != int.from_bytes(data[end - 4:end], "big"):
+            return None
+        if header is None and kind != b"IHDR":
+            return None
+        if kind == b"IHDR":
+            if header is not None or length != 13:
+                return None
+            header = payload
+        elif kind == b"PLTE":
+            if not length or length % 3 or length > 768:
+                return None
+            palette = True
+        elif kind == b"IDAT":
+            compressed.extend(payload)
+        elif kind == b"IEND":
+            if length:
+                return None
+            ended = True
+            break
+        elif not kind[0] & 32:
+            return None  # Unknown critical chunk.
+        offset = end
+    if not ended or not header or not compressed:
+        return None
+    w, h = int.from_bytes(header[:4], "big"), int.from_bytes(header[4:8], "big")
+    depth, color, compression, filtering, interlace = header[8:13]
+    depths = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+    if (not 0 < w <= 32768 or not 0 < h <= 32768 or depth not in depths.get(color, ())
+            or compression or filtering or interlace not in (0, 1) or (color == 3 and not palette)):
+        return None
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+    passes = ((0, 0, 1, 1),) if not interlace else (
+        (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+        (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+    rows = []
+    for x, y, dx, dy in passes:
+        pw, ph = max(0, (w - x + dx - 1) // dx), max(0, (h - y + dy - 1) // dy)
+        if pw and ph:
+            rows.append(((pw * channels * depth + 7) // 8 + 1, ph))
+    expected = sum(length * count for length, count in rows)
+    if expected > 256 * 1024 * 1024:
+        return None
+    try:
+        decoder = zlib.decompressobj()
+        pixels = decoder.decompress(compressed, expected + 1)
+        if len(pixels) != expected or not decoder.eof or decoder.unused_data:
+            return None
+    except zlib.error:
+        return None
+    offset = 0
+    for length, count in rows:
+        for _ in range(count):
+            if pixels[offset] > 4:
+                return None
+            offset += length
+    return w, h
+
+
 def _jpeg_size(data):
-    i = 2
-    n = len(data)
-    while i + 9 < n:
-        if data[i] != 0xFF:
+    """Validate common Huffman JPEG structure, not entropy-coded pixel values."""
+    i, n, size, saw_scan = 2, len(data), None, False
+    quant, huffman, components, scanned = set(), set(), {}, set()
+    progressive = False
+    while i + 1 < n:
+        if data[i] != 0xff:
+            return None
+        marker = data[i + 1]
+        if marker == 0xff:
             i += 1
             continue
-        marker = data[i + 1]
-        if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
+        if marker == 0xd9:
+            return size if saw_scan and scanned == set(components) else None
+        if marker == 0x01 or 0xd0 <= marker <= 0xd7:
             i += 2
             continue
-        if marker == 0xFF:  # 填充字节
-            i += 1
-            continue
+        if marker in (0x00, 0xd8) or i + 4 > n:
+            return None
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        if seg_len < 2 or i + 2 + seg_len > n:
+            return None
+        payload = data[i + 4:i + 2 + seg_len]
+        if marker == 0xdb:  # Quantization tables.
+            pos = 0
+            while pos < len(payload):
+                precision, table = payload[pos] >> 4, payload[pos] & 15
+                length = 64 * (precision + 1)
+                if precision > 1 or table > 3 or pos + 1 + length > len(payload):
+                    return None
+                values = payload[pos + 1:pos + 1 + length]
+                step = precision + 1
+                if any(int.from_bytes(values[j:j + step], "big") == 0 for j in range(0, length, step)):
+                    return None
+                quant.add(table)
+                pos += 1 + length
+        elif marker == 0xc4:  # Huffman code lengths and symbols.
+            pos = 0
+            while pos < len(payload):
+                if pos + 17 > len(payload):
+                    return None
+                kind, table = payload[pos] >> 4, payload[pos] & 15
+                counts = payload[pos + 1:pos + 17]
+                total = sum(counts)
+                if kind > 1 or table > 3 or not 0 < total <= 256 or pos + 17 + total > len(payload):
+                    return None
+                available = 1
+                for count in counts:
+                    available = 2 * available - count
+                    if available < 0:
+                        return None
+                huffman.add((kind, table))
+                pos += 17 + total
         if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                       0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+            if marker not in (0xc0, 0xc1, 0xc2) or size or seg_len < 8:
+                return None
             h = int.from_bytes(data[i + 5:i + 7], "big")
             w = int.from_bytes(data[i + 7:i + 9], "big")
-            return (w, h)
-        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
-        if seg_len < 2:
-            return None
+            count = data[i + 9]
+            if not 0 < w <= 32768 or not 0 < h <= 32768 or not 1 <= count <= 4 or seg_len != 8 + 3 * count:
+                return None
+            if payload[0] != 8:
+                return None
+            for j in range(6, len(payload), 3):
+                component, sampling, table = payload[j:j + 3]
+                if component in components or not 1 <= sampling >> 4 <= 4 or not 1 <= sampling & 15 <= 4 or table > 3:
+                    return None
+                components[component] = table
+            progressive = marker == 0xc2
+            size = (w, h)
         i += 2 + seg_len
+        if marker == 0xda:
+            if not size or seg_len < 6 or not 1 <= payload[0] <= len(components) or seg_len != 6 + 2 * payload[0]:
+                return None
+            first, last, refinement = payload[-3:]
+            if not progressive and (first, last, refinement) != (0, 63, 0):
+                return None
+            if progressive and (not 0 <= first <= last <= 63 or (first == 0 and last != 0)
+                                or (first > 0 and payload[0] != 1) or refinement >> 4 > 13 or refinement & 15 > 13):
+                return None
+            scan_components = set()
+            for j in range(1, 1 + 2 * payload[0], 2):
+                component, tables = payload[j:j + 2]
+                if component not in components or component in scan_components or components[component] not in quant:
+                    return None
+                if (not progressive or (first == 0 and refinement >> 4 == 0)) and (0, tables >> 4) not in huffman:
+                    return None
+                if (not progressive or first > 0) and (1, tables & 15) not in huffman:
+                    return None
+                scan_components.add(component)
+            scanned.update(scan_components)
+            scan_start = i
+            while i < n:
+                if data[i] != 0xff:
+                    i += 1
+                elif i + 1 < n and (data[i + 1] == 0 or 0xd0 <= data[i + 1] <= 0xd7):
+                    i += 2
+                else:
+                    break
+            if i == scan_start:
+                return None
+            saw_scan = True
     return None
 
 
@@ -143,15 +323,27 @@ def _http_json(req, timeout):
     """发请求并解析 JSON 响应。HTTPError 转成带上游消息的错误。"""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
+            request_id = resp.headers.get("x-request-id") or resp.headers.get("request-id")
+            if _REQUEST_EVENT:
+                _REQUEST_EVENT({"request_id": request_id, "response_at": task_store.now()})
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise AttemptError("next_source", "上游响应超过大小限制")
             return resp.status, _parse_json(raw), raw
     except urllib.error.HTTPError as e:
+        request_id = e.headers.get("x-request-id") if e.headers else None
+        if _REQUEST_EVENT:
+            _REQUEST_EVENT({"request_id": request_id, "response_at": task_store.now()})
         raw = b""
         try:
-            raw = e.read(2000)
+            raw = e.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raw = b"upstream error body exceeds limit"
         except Exception:
             pass
-        raise _http_error(e.code, raw)
+        error = _http_error(e.code, raw)
+        error.request_id = request_id
+        raise error
 
 
 def _http_error(code, raw):
@@ -164,10 +356,16 @@ def _http_error(code, raw):
         elif err:
             detail = str(err)
     if not detail:
-        detail = raw[:200].decode("utf-8", "replace").strip()
-    return urllib.error.HTTPError(
+        detail = _safe(raw.decode("utf-8", "replace")).strip()[:200]
+    error = urllib.error.HTTPError(
         "response", code,
-        "HTTP %d: %s" % (code, failovercfg.mask_secrets(detail)), None, None)
+        "HTTP %d: %s" % (code, _safe(detail)), None, None)
+    upstream = parsed.get("error", parsed) if isinstance(parsed, dict) else {}
+    if isinstance(upstream, dict):
+        error.upstream_code = str(upstream.get("code") or "").lower()
+        error.upstream_type = str(upstream.get("type") or "").lower()
+        error.upstream_param = str(upstream.get("param") or "").lower()
+    return error
 
 
 def _parse_json(raw):
@@ -202,6 +400,8 @@ def attempt_source(src, prompt, size, input_image, model, verbose=False):
     成功返回 dict（含 image_bytes/ext/尺寸/耗时/命中的源与模型）；
     失败抛 AttemptError(kind, message)。
     """
+    global _SECRETS
+    _SECRETS = tuple(set(_SECRETS + (src["api_key"],)))
     base = src["base_url"].rstrip("/")
     model = (model or "").strip()
     if not model:
@@ -237,19 +437,51 @@ def attempt_source(src, prompt, size, input_image, model, verbose=False):
     except urllib.error.HTTPError as e:
         code = e.code
         msg = str(e.reason)  # _http_error 构造时已带 "HTTP <code>: <detail>"
+        request_id = getattr(e, "request_id", None)
+        structured = {getattr(e, "upstream_code", ""), getattr(e, "upstream_type", "")}
+        if (any("policy" in value or "safety" in value or "moderation" in value for value in structured)
+                or any(term in msg.lower() for term in ("content policy", "content_policy", "safety filter", "safety system", "内容安全", "内容政策"))):
+            raise AttemptError("fatal", msg, request_id)
+        if code == 408 or 500 <= code < 600:
+            # A gateway/server failure does not prove that the paid POST had no
+            # side effects. No cross-provider idempotency/reconciliation exists.
+            # RFC 9110 section 9.2.2 advises against retrying without such evidence.
+            raise AttemptError("unknown", msg + "（上游可能已执行或计费；请核对请求记录，不会自动换源/换模型）", request_id)
         if code in FAILOVER_SOURCE_HTTP:
-            raise AttemptError("next_source", msg)
-        if code == 404 or code >= 500:
-            raise AttemptError("next_model", msg)
-        raise AttemptError("fatal", msg + "（请求被拒绝，检查模型 ID/尺寸/提示词，勿反复重试）")
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-        raise AttemptError("next_source", "连接失败: %s" % failovercfg.mask_secrets(e))
+            raise AttemptError("next_source", msg, request_id, disable_source=True)
+        unsupported = {"unsupported_size", "invalid_size", "size_not_supported", "unsupported_model",
+                       "model_not_supported", "model_not_found", "invalid_model"}
+        if code in (400, 422) and structured & unsupported:
+            kind = "next_source" if structured & {"unsupported_size", "invalid_size", "size_not_supported"} else "next_model"
+            raise AttemptError(kind, msg, request_id)
+        if code == 404:
+            raise AttemptError("next_model", msg, request_id)
+        raise AttemptError("fatal", msg + "（请求被拒绝，检查模型 ID/尺寸/提示词，勿反复重试）", request_id)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as e:
+        reason = e.reason if isinstance(e, urllib.error.URLError) else e
+        safe = isinstance(reason, (ConnectionRefusedError, socket.gaierror, ssl.SSLCertVerificationError)) or getattr(reason, "errno", None) in (errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH)
+        kind = "next_source" if safe else "unknown"
+        message = "连接失败: %s" % _safe(e)
+        if not safe:
+            message += "（请求可能已发送，状态未知；不会自动重试）"
+        raise AttemptError(kind, message, disable_source=safe) from None
 
     image_bytes = _extract_image(data, timeout)
-    info = detect_image(image_bytes)
-    if not info:
-        raise AttemptError("next_source", "响应内容不是有效的 PNG/JPEG 图片")
-    ext, w, h = info
+    if image_bytes.startswith(JPEG_MAGIC):
+        try:
+            # The decoder classifies unsupported coding before structural or
+            # entropy checks, so local limitations never trigger another charge.
+            dimensions = image_decode.validate_jpeg(image_bytes)
+        except image_decode.DecoderUnavailable as error:
+            raise AttemptError("fatal", str(error)) from None
+        except image_decode.InvalidImage as error:
+            raise AttemptError("next_source", str(error)) from None
+        ext, (w, h) = "jpg", dimensions
+    else:
+        info = detect_image(image_bytes)
+        if not info:
+            raise AttemptError("next_source", "图片未通过 PNG/JPEG 完整性与结构检查")
+        ext, w, h = info
     return {
         "image_bytes": image_bytes,
         "ext": ext,
@@ -270,13 +502,13 @@ def _extract_image(data, timeout):
         raise AttemptError("next_model", "响应不是 JSON 对象")
     items = data.get("data") if isinstance(data.get("data"), list) else None
     if not items and isinstance(data.get("images"), list):
-        items = [{"x": v} for v in data["images"]]
+        items = data["images"]
     if not items:
         raise AttemptError("next_model", "响应中没有 data/images 图片字段: %s"
-                           % failovercfg.mask_secrets(json.dumps(data, ensure_ascii=False)[:200]))
+                           % _safe(json.dumps(data, ensure_ascii=False))[:200])
     item = items[0]
     if isinstance(item, dict) and item.get("b64_json"):
-        return base64.b64decode(item["b64_json"])
+        return _decode_image_base64(item["b64_json"])
     url = None
     if isinstance(item, dict):
         url = item.get("url") or item.get("image_url")
@@ -284,21 +516,41 @@ def _extract_image(data, timeout):
         url = item
     if isinstance(url, dict):
         url = url.get("url")
-    if not url:
+    if not isinstance(url, str) or not url:
         raise AttemptError("next_model", "响应条目里没有 url/b64_json")
     if url.startswith("data:"):
-        b64 = url.split(",", 1)[1] if "," in url else ""
-        return base64.b64decode(b64)
+        head, separator, b64 = url.partition(",")
+        if not separator or not head.startswith("data:image/") or not head.endswith(";base64"):
+            raise AttemptError("next_model", "图片 data URI 格式无效")
+        return _decode_image_base64(b64)
     return _download(url, timeout)
+
+
+def _decode_image_base64(value):
+    try:
+        if not isinstance(value, str) or len(value) > MAX_RESPONSE_BYTES:
+            raise ValueError("invalid base64 value")
+        data = base64.b64decode("".join(value.split()), validate=True)
+        if not data or len(data) > MAX_IMAGE_BYTES:
+            raise ValueError("invalid image length")
+        return data
+    except (ValueError, binascii.Error):
+        raise AttemptError("next_model", "上游图片 Base64 数据无效或超过大小限制") from None
 
 
 def _download(url, timeout):
     try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("invalid download URL")
         req = urllib.request.Request(url, headers={"User-Agent": "failover-imagegen-tool/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-        raise AttemptError("next_source", "下载图片失败 %s（%s）"
+            data = resp.read(MAX_IMAGE_BYTES + 1)
+            if len(data) > MAX_IMAGE_BYTES:
+                raise ValueError("image too large")
+            return data
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError, http.client.HTTPException) as e:
+        raise AttemptError("unknown", "下载图片失败 %s（%s）；生成可能已完成，请先核对上游记录/费用，不自动重复生成"
                            % (failovercfg.endpoint_host(url), type(e).__name__)) from None
 
 
@@ -309,81 +561,224 @@ def _attempt_plan_count(sources, model_override):
                for s in sources)
 
 
+def _attempt_worker(connection, arguments, secrets):
+    global _SECRETS, _REQUEST_EVENT
+    _SECRETS = secrets
+    if os.name != "nt":
+        os.setsid()
+    _REQUEST_EVENT = lambda event: connection.send(("event", event))
+    try:
+        result = attempt_source(*arguments)
+        connection.send(("result", result))
+    except AttemptError as error:
+        connection.send(("error", {"kind": error.kind, "message": error.message,
+                                     "request_id": error.request_id,
+                                     "disable_source": error.disable_source}))
+    except BaseException as error:
+        connection.send(("error", {"kind": "unknown", "message": _safe(error)}))
+    finally:
+        connection.close()
+
+
+def _stop_worker(process):
+    if process.is_alive():
+        if os.name != "nt":
+            import signal
+            try:
+                if os.getpgid(process.pid) == process.pid:
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+        else:
+            try:
+                # Windows does not terminate decoder descendants with terminate().
+                if not isinstance(process.pid, int) or process.pid <= 0:
+                    raise ValueError("invalid child process ID")
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                process.terminate()
+        process.join(0.5)
+        if process.is_alive():
+            process.kill()
+    process.join(0.5)
+
+
+def _bounded_attempt(arguments, deadline_at, cancelled, on_event):
+    """A killable child bounds connect, reads, downloads and image decoding."""
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_attempt_worker, args=(sender, arguments, tuple(_SECRETS)), daemon=True)
+    process.start()
+    sender.close()
+    try:
+        while True:
+            if receiver.poll(0.05):
+                try:
+                    kind, value = receiver.recv()
+                except EOFError:
+                    raise AttemptError("unknown", "请求进程意外退出；上游结果未知") from None
+                if kind == "event":
+                    if on_event:
+                        on_event(value)
+                elif kind == "result":
+                    return value
+                else:
+                    raise AttemptError(**value)
+            if cancelled and cancelled():
+                raise AttemptError("unknown", "已取消等待；请求可能已被接收，请核对上游结果后再重试")
+            if time.monotonic() >= deadline_at:
+                raise AttemptError("unknown", "达到任务总时限；请求可能已被接收，不会自动切换或重试")
+            if not process.is_alive() and not receiver.poll():
+                raise AttemptError("unknown", "请求进程意外退出；上游结果未知")
+    except KeyboardInterrupt:
+        if on_event:
+            on_event({"cancel_requested": True})
+        raise AttemptError("unknown", "用户中断等待；请求可能仍在上游执行") from None
+    finally:
+        _stop_worker(process)
+        receiver.close()
+
+
+def _capability_error(src, size, model):
+    allowed = src.get("supported_sizes")
+    if allowed is not None:
+        if not isinstance(allowed, list) or not allowed or any(not isinstance(v, str) for v in allowed):
+            return "fatal", "supported_sizes 必须是非空字符串数组"
+        try:
+            dimensions = [parse_size(value) for value in allowed]
+        except ValueError:
+            return "fatal", "supported_sizes 含无法识别的尺寸"
+        if tuple(size) not in dimensions:
+            return "next_source", "该源明确不支持请求尺寸 %dx%d，已跳过且不会自动调整尺寸" % size
+    allowed = src.get("supported_models")
+    if allowed is not None:
+        if not isinstance(allowed, list) or not allowed or any(not isinstance(v, str) or not v.strip() for v in allowed):
+            return "fatal", "supported_models 必须是非空字符串数组"
+        if model not in allowed:
+            return "next_model", "该源明确不支持模型 %s，已跳过" % model
+    return None
+
+
 def _run_attempts(sources, prompt, size, input_image, model_override,
-                  verbose=False, failover=True):
-    """跑完整「站×模型」级联。返回 (result|None, attempts)。
-    failover=False 时只尝试首位源的首个模型，失败不切换（用户主动关闭故障转移）。"""
+                  verbose=False, failover=True, deadline_at=None, cancelled=None,
+                  on_attempts=None, unavailable=None):
+    """Run a cascade; unknown outcomes never move to another paid request."""
+    global _SECRETS
+    _SECRETS = tuple(set(_SECRETS + tuple(s["api_key"] for s in sources)))
     if not failover:
         sources = sources[:1]
+    unavailable = unavailable if unavailable is not None else set()
     total = _attempt_plan_count(sources, model_override) if failover else 1
-    attempts = []
-    idx = 0
+    attempts, idx = [], 0
     for si, src in enumerate(sources):
+        if src["name"] in unavailable:
+            continue
         models = [model_override] if model_override else failovercfg.source_models(src)
         if not failover:
             models = models[:1]
         for model in models:
+            if (cancelled and cancelled()) or (deadline_at is not None and time.monotonic() >= deadline_at):
+                return None, attempts
             idx += 1
             host = failovercfg.endpoint_host(src["base_url"])
-            print("[%d/%d] 尝试源 %s（%s，模型 %s）..."
-                  % (idx, total, src["name"], host, model))
+            print("[%d/%d] 尝试源 %s（%s，模型 %s）..." % (idx, total, src["name"], host, model), flush=True)
+            attempt = {"source": src["name"], "host": host, "model": model, "ok": False,
+                       "status": "running", "started_at": task_store.now(), "request_id": None}
+            attempts.append(attempt)
+            if on_attempts:
+                on_attempts(attempts)
+            started = time.monotonic()
             try:
-                result = attempt_source(src, prompt, size, input_image, model,
-                                        verbose=verbose)
-            except AttemptError as e:
-                attempts.append({
-                    "source": src["name"], "host": host, "model": model,
-                    "ok": False, "strategy": e.kind, "error": e.message,
-                })
-                if e.kind == "fatal":
-                    print("    ✗ 致命错误，停止尝试（不会换站/换模型重试）：%s" % e.message)
-                    print("      提示：先确认模型 ID 和允许的尺寸，只调整对应参数；不要为绕过 4xx 反复重试。")
+                incompatible = _capability_error(src, size, model)
+                if incompatible:
+                    attempt["sent"] = False
+                    raise AttemptError(*incompatible)
+                attempt["sent"] = True
+                if on_attempts:
+                    on_attempts(attempts)
+                def event_received(event):
+                    attempt.update(failovercfg.redact_data(event, _SECRETS))
+                    if on_attempts:
+                        on_attempts(attempts)
+                arguments = (src, prompt, size, input_image, model, verbose)
+                result = (_bounded_attempt(arguments, deadline_at, cancelled, event_received)
+                          if deadline_at is not None else attempt_source(*arguments))
+            except AttemptError as error:
+                attempt.update(ok=False, status="unknown" if error.kind == "unknown" else "failed",
+                               strategy=error.kind, error=_safe(error.message),
+                               elapsed_seconds=round(time.monotonic() - started, 3), finished_at=task_store.now())
+                if error.request_id:
+                    attempt["request_id"] = _safe(error.request_id)
+                if on_attempts:
+                    on_attempts(attempts)
+                if error.disable_source:
+                    unavailable.add(src["name"])
+                if error.kind in ("fatal", "unknown"):
+                    label = "状态未知" if error.kind == "unknown" else "致命错误"
+                    print("    ✗ %s，停止尝试：%s" % (label, error.message), flush=True)
                     return None, attempts
                 if not failover:
-                    print("    ✗ %s —— 故障转移已关闭，不切换其他源/模型" % e.message)
+                    print("    ✗ %s —— 故障转移已关闭，不切换其他源/模型" % error.message)
                     return None, attempts
-                if e.kind == "next_source":
-                    print("    ✗ %s —— 切换下一个中转站" % e.message)
-                    break  # 跳过本站剩余模型，进入下一个源
-                if model == models[-1]:  # 本站模型用尽
-                    if si < len(sources) - 1:
-                        print("    ✗ %s —— 本站模型用尽，切换下一个中转站" % e.message)
-                    else:
-                        print("    ✗ %s" % e.message)
-                else:
-                    print("    ✗ %s —— 换本站下一个模型" % e.message)
+                if error.kind == "next_source" or model == models[-1]:
+                    print("    ✗ %s —— 切换下一个中转站" % error.message)
+                    break
+                print("    ✗ %s —— 换本站下一个模型" % error.message)
                 continue
-            attempts.append({
-                "source": src["name"], "host": host, "model": model,
-                "ok": True, "elapsed_seconds": result["elapsed"],
-            })
+            attempt.update(ok=True, status="succeeded", elapsed_seconds=result["elapsed"],
+                           finished_at=task_store.now())
+            if on_attempts:
+                on_attempts(attempts)
             return result, attempts
     return None, attempts
 
 
 def unique_path(path):
     """已存在则追加 -2/-3 后缀，避免覆盖。"""
-    if not os.path.exists(path):
+    if not os.path.exists(path) and not os.path.exists(os.path.splitext(path)[0] + ".meta.json"):
         return path
     stem, ext = os.path.splitext(path)
     for i in range(2, 1000):
         cand = "%s-%d%s" % (stem, i, ext)
-        if not os.path.exists(cand):
+        if not os.path.exists(cand) and not os.path.exists(os.path.splitext(cand)[0] + ".meta.json"):
             return cand
     raise RuntimeError("无法生成唯一文件名: " + path)
 
 
 def save_outputs(outdir, name, force, size, result, prompt, prompt_file,
-                 input_image, attempts, started_at):
+                 input_image, attempts, started_at, secrets=()):
     """落盘图片 + meta.json，返回 (img_path, meta_path, meta)。"""
     os.makedirs(outdir, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     base_name = "%s-%s-%s" % (name, ts, size_tag(*size))
     img_path = os.path.join(outdir, base_name + "." + result["ext"])
-    if not force:
-        img_path = unique_path(img_path)  # 已存在则追加 -2/-3，--force 才覆盖
-    with open(img_path, "wb") as f:
-        f.write(result["image_bytes"])
+    if force:
+        failovercfg.atomic_write(img_path, result["image_bytes"])
+    else:
+        original_path = img_path
+        while True:
+            img_path = unique_path(original_path)
+            try:
+                stream = open(img_path, "xb")  # Reserve atomically across tasks/processes.
+            except FileExistsError:
+                continue
+            try:
+                with stream:
+                    stream.write(result["image_bytes"])
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                # Only this exclusively-created file belongs to this failed write.
+                try:
+                    os.unlink(img_path)
+                except FileNotFoundError:
+                    pass
+                raise
+            break
 
     meta = {
         "name": name,
@@ -407,10 +802,9 @@ def save_outputs(outdir, name, force, size, result, prompt, prompt_file,
         "duration_seconds": round(time.time() - started_at, 2),
         "attempts": attempts,  # 错误文本会尝试脱敏，仍需在分享前检查
     }
+    meta = failovercfg.redact_data(meta, tuple(_SECRETS) + tuple(secrets))
     meta_path = os.path.splitext(img_path)[0] + ".meta.json"
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    failovercfg.atomic_write(meta_path, (json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
     return img_path, meta_path, meta
 
 
@@ -463,6 +857,7 @@ def read_prompt(args):
 
 
 def _load_cfg_or_exit():
+    global _SECRETS
     try:
         cfg = failovercfg.load_config()
     except RuntimeError as e:
@@ -473,6 +868,7 @@ def _load_cfg_or_exit():
             "--base-url <地址> --api-key <密钥> --model <模型> 保存至少一个已启用的中转源，"
             "再用 --list-sources 检查。" % failovercfg.config_path()
         )
+    _SECRETS = tuple(s["api_key"] for s in cfg["sources"])
     return cfg
 
 
@@ -516,90 +912,190 @@ def _prepare_generate(args):
 
 # ---------------------------------------------------------------- generate
 
-def cmd_generate(args):
-    prompt, size, input_image, sources, failover = _prepare_generate(args)
-    outdir = args.outdir or "generated"
-    started_at = time.time()
-    chain = " -> ".join(s["name"] for s in (sources[:1] if not failover else sources))
-    print("生图：size=%dx%d 模式=%s 源顺序=%s%s"
-          % (size[0], size[1], "edit" if input_image else "generate", chain,
-             "" if failover else "（故障转移已关闭：仅尝试首位源首个模型）"))
-    result, attempts = _run_attempts(sources, prompt, size, input_image,
-                                     getattr(args, "model", None), args.verbose,
-                                     failover=failover)
-    if not result:
-        _fail_summary(attempts)
+def _task_record(args, kind, prompts, size, sources, failover):
+    created = task_store.now()
+    return {
+        "schema_version": 1, "id": getattr(args, "task_id", None) or str(uuid.uuid4()),
+        "name": args.name, "kind": kind, "status": "queued", "created_at": created,
+        "updated_at": created, "started_at": None, "finished_at": None,
+        "cancel_requested": False, "duration_seconds": 0,
+        "items": [{"id": str(index), "prompt": prompt, "status": "queued", "error": None,
+                   "output": None, "attempts": [], "created_at": created, "updated_at": created,
+                   "started_at": None, "finished_at": None}
+                  for index, prompt in enumerate(prompts, 1)],
+        "sources": [source["name"] for source in sources], "size": list(size),
+        "options": {"model": getattr(args, "model", None),
+                    "input_image": os.path.abspath(args.input_image) if getattr(args, "input_image", None) else None,
+                    "outdir": os.path.abspath(getattr(args, "outdir", None) or "generated"),
+                    "force": getattr(args, "force", False), "failover": failover,
+                    "prompt_file": os.path.abspath(getattr(args, "prompt_file", None) or args.prompts_file)
+                                   if getattr(args, "prompt_file", None) or getattr(args, "prompts_file", None) else None,
+                    "deadline": getattr(args, "deadline", 600) if math.isfinite(float(getattr(args, "deadline", 600))) else 600, "verbose": getattr(args, "verbose", False)},
+    }
+
+
+def _execute_task(directory, record, sources, selected, raw_prompts=None):
+    started = time.time()
+    deadline_at = time.monotonic() + float(record["options"].get("deadline", 600))
+    options, size = record["options"], tuple(record["size"])
+    record.update(started_at=task_store.now(), finished_at=None)
+    unavailable = set()
+    def persist():
+        record["duration_seconds"] = round(time.time() - started, 3)
+        task_store.save_task(directory, record, _SECRETS)
+    def cancelled():
+        return task_store.load_task(directory, record["id"]).get("cancel_requested", False)
+    print("任务: %s" % record["id"], flush=True)
+    for item in record["items"]:
+        if item["id"] not in selected:
+            continue
+        if cancelled() or time.monotonic() >= deadline_at:
+            item.update(status="cancelled", error="已取消或达到总时限，尚未发送此条请求",
+                        updated_at=task_store.now(), finished_at=task_store.now())
+            persist()
+            continue
+        prompt = raw_prompts.get(item["id"], item["prompt"]) if raw_prompts else item["prompt"]
+        item.update(status="running", error=None, started_at=task_store.now(), finished_at=None,
+                    updated_at=task_store.now())
+        old_attempts = list(item.get("attempts", []))
+        persist()
+        print("\n===== [%s/%d] %s =====" % (item["id"], len(record["items"]), _safe(prompt)[:40]), flush=True)
+        def attempts_changed(attempts):
+            item["attempts"] = old_attempts + attempts
+            item["updated_at"] = task_store.now()
+            persist()
+        try:
+            result, attempts = _run_attempts(
+                sources, prompt, size, options.get("input_image"), options.get("model"),
+                options.get("verbose", False), failover=options.get("failover", True),
+                deadline_at=deadline_at, cancelled=cancelled, on_attempts=attempts_changed,
+                unavailable=unavailable)
+            if result:
+                name = record["name"] if record["kind"] == "generate" else "%s-%02d" % (record["name"], int(item["id"]))
+                try:
+                    img_path, meta_path, meta = save_outputs(
+                        options["outdir"], name, options.get("force", False), size, result, prompt,
+                        options.get("prompt_file"), options.get("input_image"), item["attempts"], started, _SECRETS)
+                except (OSError, ValueError) as error:
+                    raise AttemptError("unknown", "上游已返回图片但本地保存失败；请检查输出目录，勿直接重复生成: " + _safe(error)) from None
+                item.update(status="succeeded", output={"image": os.path.abspath(img_path),
+                            "metadata": os.path.abspath(meta_path), "width": result["width"],
+                            "height": result["height"], "source": result["source_name"], "model": result["model"]})
+                _print_success(result, img_path, meta_path, meta, attempts)
+            else:
+                last = attempts[-1] if attempts else {}
+                if last.get("cancel_requested"):
+                    record["cancel_requested"] = True
+                item["status"] = "unknown" if last.get("strategy") == "unknown" else "failed"
+                item["error"] = last.get("error") or "没有可用候选源，或任务已取消/达到总时限"
+        except (KeyboardInterrupt, AttemptError, OSError, RuntimeError) as error:
+            if isinstance(error, KeyboardInterrupt):
+                record["cancel_requested"] = True
+            item["status"] = "unknown"
+            item["error"] = _safe(error) or "执行已中断，结果未知"
+            for attempt in item.get("attempts", []):
+                if attempt.get("status") == "running":
+                    attempt.update(status="unknown", strategy="unknown", ok=False, error=item["error"], finished_at=task_store.now())
+        item.update(updated_at=task_store.now(), finished_at=task_store.now())
+        persist()
+    record["finished_at"] = task_store.now()
+    persist()
+    counts = record["counts"]
+    if record["kind"] == "batch":
+        print("\n===== 批量汇总：成功 %d / 失败 %d / 共 %d（总耗时 %.1fs）=====" %
+              (counts["succeeded"], counts["failed"] + counts["unknown"], counts["total"], record["duration_seconds"]))
+    print("任务状态: %s；记录: %s" % (record["status"], os.path.join(directory, record["id"] + ".json")))
+    return 0 if record["status"] == "succeeded" else 1
+
+
+def _create_and_run(args, kind):
+    directory = getattr(args, "jobs_dir", None) or task_store.default_jobs_dir()
+    prompts, size, sources, failover = [], DEFAULT_SIZE, [], True
+    try:
+        cfg = _load_cfg_or_exit()
+        if kind == "generate":
+            prompts = [read_prompt(args)]
+        else:
+            with open(args.prompts_file, encoding="utf-8-sig") as stream:
+                prompts = [line.strip() for line in stream if line.strip() and not line.strip().startswith("#")]
+            if not prompts:
+                raise ValueError("提示词列表里没有有效提示词（一行一图）")
+            if any(len(prompt) > 32000 for prompt in prompts):
+                raise ValueError("提示词过长（每条上限 32000 字符）")
+        size = parse_size(args.size)
+        if getattr(args, "input_image", None) and not os.path.isfile(args.input_image):
+            raise ValueError("输入图片不存在：" + args.input_image)
+        if not math.isfinite(float(getattr(args, "deadline", 600))) or float(getattr(args, "deadline", 600)) <= 0:
+            raise ValueError("总时限必须是大于 0 的有限秒数")
+        sources = pick_sources(cfg, getattr(args, "source", None), getattr(args, "model", None))
+        failover = failovercfg.failover_enabled(cfg)
+    except (OSError, ValueError, SystemExit) as error:
+        prompts = prompts or [getattr(args, "prompt", None) or ""]
+        record = _task_record(args, kind, prompts, size, sources, failover)
+        for item in record["items"]:
+            item.update(status="failed", error=_safe(error), finished_at=task_store.now())
+        record["finished_at"] = task_store.now()
+        task_store.create_task(directory, record, _SECRETS)
+        print("错误：%s" % error)
         return 1
-    img_path, meta_path, meta = save_outputs(
-        outdir, args.name, args.force, size, result, prompt,
-        getattr(args, "prompt_file", None), input_image, attempts, started_at)
-    _print_success(result, img_path, meta_path, meta, attempts)
+    record = _task_record(args, kind, prompts, size, sources, failover)
+    with task_store.task_lock(directory, record["id"]):
+        task_store.create_task(directory, record, _SECRETS)
+        if not failover:
+            print("故障转移已关闭：仅尝试首位源首个模型")
+        return _execute_task(directory, record, sources, {item["id"] for item in record["items"]},
+                             {str(index): prompt for index, prompt in enumerate(prompts, 1)})
+
+
+def cmd_generate(args):
+    return _create_and_run(args, "generate")
+
+
+def cmd_batch(args):
+    return _create_and_run(args, "batch")
+
+
+def cmd_history(args):
+    records = task_store.list_tasks(args.jobs_dir)
+    if args.json:
+        builtins.print(json.dumps(records, ensure_ascii=False))
+    else:
+        for record in records:
+            print("%s  %s  %s" % (record["id"], record["status"], record.get("name", "")))
     return 0
 
 
-# ---------------------------------------------------------------- batch
+def cmd_cancel(args):
+    record = task_store.cancel_task(args.jobs_dir, args.task_id)
+    print("已请求取消任务 %s；已发送的请求须核对上游结果" % record["id"])
+    return 0
 
-def cmd_batch(args):
-    path = args.prompts_file
-    if not os.path.isfile(path):
-        raise SystemExit("错误：提示词列表文件不存在：%s" % path)
-    with open(path, "r", encoding="utf-8-sig") as f:
-        lines = [ln.strip() for ln in f.read().splitlines()]
-    prompts = [ln for ln in lines if ln and not ln.startswith("#")]
-    if not prompts:
-        raise SystemExit("错误：%s 里没有有效提示词（一行一图，# 开头为注释）。" % path)
 
-    try:
-        size = parse_size(args.size)
-    except ValueError as e:
-        raise SystemExit("错误：%s" % e)
-    cfg = _load_cfg_or_exit()
-    sources = pick_sources(cfg, args.source, args.model)
-    failover = failovercfg.failover_enabled(cfg)
-    outdir = args.outdir or "generated"
-
-    total = len(prompts)
-    chain = " -> ".join(s["name"] for s in (sources[:1] if not failover else sources))
-    print("批量生图：共 %d 张，size=%dx%d，输出目录 %s，源顺序=%s%s"
-          % (total, size[0], size[1], outdir, chain,
-             "" if failover else "（故障转移已关闭：仅尝试首位源首个模型）"))
-    results = []  # (序号, 提示词, ok, 产物路径, 失败原因)
-    t_all = time.time()
-    try:
-        for i, p in enumerate(prompts, 1):
-            print("\n===== [%d/%d] %s =====" % (i, total, p[:40]))
-            t0 = time.time()
-            result, attempts = _run_attempts(sources, p, size, None,
-                                             args.model, args.verbose,
-                                             failover=failover)
-            if result:
-                img_path, _mp, _meta = save_outputs(
-                    outdir, "%s-%02d" % (args.name, i), args.force, size, result,
-                    p, path, None, attempts, t0)
-                print("图片: %s" % img_path)
-                results.append((i, p, True, img_path, None))
-            else:
-                last = attempts[-1] if attempts else {}
-                results.append((i, p, False, None,
-                                "%s/%s: %s" % (last.get("source", "?"),
-                                               last.get("model", "?"),
-                                               last.get("error", "未知错误"))))
-    except KeyboardInterrupt:
-        print("\n已中断（Ctrl+C）。已完成 %d/%d 张。" % (len(results), total))
-
-    ok_n = sum(1 for r in results if r[2])
-    fail_n = len(results) - ok_n
-    print("\n===== 批量汇总：成功 %d / 失败 %d / 共 %d（总耗时 %.1fs）====="
-          % (ok_n, fail_n, total, time.time() - t_all))
-    for i, p, ok, out, err in results:
-        head = p[:24] + ("…" if len(p) > 24 else "")
-        if ok:
-            print("  [%d] ✓ %s -> %s" % (i, head, os.path.basename(out)))
-        else:
-            print("  [%d] ✗ %s -> %s" % (i, head, err))
-    if fail_n:
-        print("提示：失败的条目可从上面的错误判断原因；致命 400/422 请检查模型 ID 与尺寸后重跑。")
-    return 0 if fail_n == 0 and len(results) == total else 1
+def cmd_retry(args):
+    directory = args.jobs_dir or task_store.default_jobs_dir()
+    with task_store.task_lock(directory, args.task_id):
+        record = task_store.recover_task(directory, args.task_id)
+        eligible = {"queued", "failed", "cancelled"}
+        if args.confirm_unknown:
+            eligible.add("unknown")
+        selected = {item["id"] for item in record["items"] if item["status"] in eligible}
+        if not selected:
+            print("没有可安全重试的条目；状态未知的条目须先核对上游，再使用 --confirm-unknown 确认")
+            return 1
+        cfg = _load_cfg_or_exit()
+        sources = [source for name in record.get("sources", []) for source in failovercfg.enabled_sources(cfg) if source["name"] == name]
+        if not sources:
+            raise RuntimeError("原任务的源均已移除或禁用；请先恢复配置")
+        record["cancel_requested"] = False
+        if args.deadline is not None:
+            if not math.isfinite(args.deadline) or args.deadline <= 0:
+                raise RuntimeError("总时限必须是大于 0 的有限秒数")
+            record["options"]["deadline"] = args.deadline
+        for item in record["items"]:
+            if item["id"] in selected:
+                item["status"] = "queued"
+        task_store.save_task(directory, record, _SECRETS, reset_cancel=True)
+        return _execute_task(directory, record, sources, selected)
 
 
 # ---------------------------------------------------------------- 模型发现
@@ -622,7 +1118,7 @@ def cmd_models(args):
             print("  ✗ HTTP %d：%s（检查密钥/地址）" % (e.code, e.reason))
             continue
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            print("  ✗ 不可达：%s" % failovercfg.mask_secrets(e))
+            print("  ✗ 不可达：%s" % _safe(e))
             continue
         ids = []
         items = data.get("data") if isinstance(data, dict) else None
@@ -687,7 +1183,7 @@ def cmd_check(_args):
                       % (src["name"], host, latency, e.code))
                 ok_count += 1
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            print("  ✗ %s（%s）不可达：%s" % (src["name"], host, failovercfg.mask_secrets(e)))
+            print("  ✗ %s（%s）不可达：%s" % (src["name"], host, _safe(e)))
 
     print("\n== 历史统计（%s）==" % os.path.join("generated", "*.meta.json"))
     stats = {}
@@ -734,7 +1230,17 @@ def cmd_list_sources(_args):
     return 0
 
 
+def _termination_requested(_signum, _frame):
+    # GUI shutdown uses SIGTERM after a cancellation write cannot complete.
+    # Unwind the bounded-request finally block before the parent engine exits.
+    raise KeyboardInterrupt("进程收到终止请求")
+
+
 def main(argv=None):
+    try:
+        signal.signal(signal.SIGTERM, _termination_requested)
+    except ValueError:
+        pass  # Embedded callers outside the main thread cannot install handlers.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -775,6 +1281,26 @@ def main(argv=None):
     b.add_argument("--verbose", action="store_true", help="打印请求细节（不含密钥）")
     b.set_defaults(func=cmd_batch)
 
+    for command in (g, b):
+        command.add_argument("--jobs-dir", default=None, help="私有任务记录目录")
+        command.add_argument("--task-id", help="预先分配的任务 UUID")
+        command.add_argument("--deadline", type=float, default=600, help="任务总时限（秒，默认 600）")
+
+    history = sub.add_parser("history", help="读取任务历史与恢复中断状态")
+    history.add_argument("--jobs-dir", default=None)
+    history.add_argument("--json", action="store_true")
+    history.set_defaults(func=cmd_history)
+    retry = sub.add_parser("retry", help="仅重试失败或未发送的任务条目")
+    retry.add_argument("--jobs-dir", default=None)
+    retry.add_argument("--task-id", required=True)
+    retry.add_argument("--confirm-unknown", action="store_true", help="已核对上游，明确确认未知状态可重试")
+    retry.add_argument("--deadline", type=float, default=None)
+    retry.set_defaults(func=cmd_retry)
+    cancel = sub.add_parser("cancel", help="协作取消任务")
+    cancel.add_argument("--jobs-dir", default=None)
+    cancel.add_argument("--task-id", required=True)
+    cancel.set_defaults(func=cmd_cancel)
+
     m = sub.add_parser("models", help="发现各中转站支持的生图模型")
     m.add_argument("--source", help="只查某个源")
     m.set_defaults(func=cmd_models)
@@ -790,10 +1316,15 @@ def main(argv=None):
     if args.check:
         return cmd_check(args)
     if getattr(args, "func", None):
-        return args.func(args)
+        try:
+            return args.func(args)
+        except (RuntimeError, OSError, ValueError) as error:
+            print("错误：%s" % error, file=sys.stderr)
+            return 1
     parser.print_help()
     return 0
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

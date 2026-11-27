@@ -8,6 +8,8 @@
 AppId={{AD6F616E-EE64-467A-8DD7-935BCB23A218}
 AppName=IMG Switch
 AppVersion={#AppVersion}
+VersionInfoVersion={#NumericVersion}.{#BuildNumber}
+VersionInfoProductVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\IMG Switch
 DefaultGroupName=IMG Switch
 PrivilegesRequired=lowest

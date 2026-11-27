@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """failover-imagegen-tool 端到端验证：本地模拟中转站 + 子进程真实运行脚本。
 
-覆盖：多源故障切换（500/401/404/连接拒绝/下载失败/无图响应）、致命 400 不换源、
+覆盖：安全故障切换（401/404/连接拒绝/无图响应）、500及下载失败保持未知、致命400不换源、
 URL 与 b64 两种响应、尺寸别名与默认值、编辑模式、meta.json 脱敏、
 setup.py 配置管理全流程、GUI 冒烟。全部通过则退出码 0。
 """
@@ -121,8 +121,8 @@ def start(mode):
 
 # ---------------------------------------------------------------- 用例
 
-def t1_failover_500_to_b64():
-    s1, s2 = start("fail500"), start("ok_b64")
+def t1_failover_401_to_b64():
+    s1, s2 = start("auth401"), start("ok_b64")
     wd = tempfile.mkdtemp()
     cfg = os.path.join(wd, "config.json")
     write_config(cfg, [make_src("dead", s1.server_address[1]),
@@ -135,8 +135,8 @@ def t1_failover_500_to_b64():
     meta, meta_path = read_meta(wd)
     att = meta["attempts"]
     assert len(att) == 2, "应有两个源的尝试记录，实际 %d" % len(att)
-    assert att[0]["source"] == "dead" and att[0]["ok"] is False and "500" in att[0]["error"], \
-        "第一个源应为 500 失败: %s" % att[0]
+    assert att[0]["source"] == "dead" and att[0]["ok"] is False and "401" in att[0]["error"], \
+        "第一个源应为 401 失败: %s" % att[0]
     assert att[1]["source"] == "alive" and att[1]["ok"] is True, "第二个源应成功: %s" % att[1]
     assert meta["size_actual"] == {"width": 2560, "height": 1440}, \
         "实际尺寸不符: %s" % meta["size_actual"]
@@ -145,11 +145,11 @@ def t1_failover_500_to_b64():
     assert "sk-mock-secret" not in meta_text and "api_key" not in meta_text, \
         "meta.json 泄露密钥字段或内容"
     assert "切换下一个中转站" in p.stdout, "stdout 应体现切换动作"
-    return "500→b64 故障切换成功，meta 记录 2 次尝试"
+    return "401→b64 故障切换成功，meta 记录 2 次尝试"
 
 
-def t2_failover_500_to_url():
-    s1, s2 = start("fail500"), start("ok_url")
+def t2_failover_401_to_url():
+    s1, s2 = start("auth401"), start("ok_url")
     wd = tempfile.mkdtemp()
     cfg = os.path.join(wd, "config.json")
     write_config(cfg, [make_src("dead", s1.server_address[1]),
@@ -253,35 +253,46 @@ def t8_edit_mode():
     return "编辑模式走 /images/edits 并上传参考图"
 
 
-def t9_secret_masking_in_meta():
+def t9_secret_masking_in_task():
+    """An ambiguous 500 stops; echoed credentials remain redacted in its task log."""
     s1, s2 = start("echoauth500"), start("ok_b64")
     wd = tempfile.mkdtemp()
     cfg = os.path.join(wd, "config.json")
     write_config(cfg, [make_src("echo", s1.server_address[1]),
                        make_src("ok", s2.server_address[1])])
     p = run([GEN, "generate", "--prompt-file", make_prompt(wd), "--name", "t9"], wd, cfg)
-    assert p.returncode == 0, p.stdout + p.stderr
-    meta, meta_path = read_meta(wd)
-    err = meta["attempts"][0]["error"]
-    assert "sk-mock-secret-echo" not in err, "错误消息泄露完整密钥: %s" % err
-    assert "****" in err, "错误消息未脱敏: %s" % err
-    with open(meta_path, "r", encoding="utf-8") as f:
-        assert "sk-mock-secret" not in f.read(), "meta.json 文本泄露密钥"
-    return "上游回显密钥时，meta 与 stdout 均已打码"
+    assert p.returncode == 1, p.stdout + p.stderr
+    jobs = glob.glob(os.path.join(wd, "jobs", "*.json"))
+    assert len(jobs) == 1, jobs
+    with open(jobs[0], encoding="utf-8") as stream:
+        raw = stream.read()
+        task = json.loads(raw)
+    assert task["status"] == "unknown", task
+    err = task["items"][0]["attempts"][0]["error"]
+    assert "sk-mock-secret-echo" not in raw + p.stdout + p.stderr, "错误消息泄露完整密钥"
+    assert "****" in err or "<redacted>" in err, "错误消息未脱敏: %s" % err
+    assert not s2.requests, "不应在未知500结果后调用备用源"
+    return "500保留unknown；上游回显密钥时task与stdout均脱敏"
 
 
-def t10_url_download_failover():
+def t10_url_download_unknown():
+    """Generation already returned a URL: failure to download must not charge again."""
     s1, s2 = start("url_dead"), start("ok_b64")
     wd = tempfile.mkdtemp()
     cfg = os.path.join(wd, "config.json")
     write_config(cfg, [make_src("deadurl", s1.server_address[1]),
                        make_src("ok", s2.server_address[1])])
     p = run([GEN, "generate", "--prompt-file", make_prompt(wd), "--name", "t10"], wd, cfg)
-    assert p.returncode == 0, p.stdout + p.stderr
-    meta, _ = read_meta(wd)
-    assert meta["attempts"][0]["ok"] is False and "下载图片失败" in meta["attempts"][0]["error"], \
-        meta["attempts"][0]
-    return "图片下载失败可切换源"
+    assert p.returncode == 1, p.stdout + p.stderr
+    jobs = glob.glob(os.path.join(wd, "jobs", "*.json"))
+    assert len(jobs) == 1, jobs
+    with open(jobs[0], encoding="utf-8") as stream:
+        task = json.load(stream)
+    assert task["status"] == "unknown", task
+    attempts = task["items"][0]["attempts"]
+    assert len(attempts) == 1 and "下载图片失败" in attempts[0]["error"], attempts
+    assert not s2.requests, "下载失败后不应重新调用备用源付费生图"
+    return "图片已生成但下载失败记为 unknown，不自动重复生成"
 
 
 def t11_auth401_failover():
@@ -390,23 +401,26 @@ def t18_gui_model_combobox():
     return "模型字段为可编辑下拉：预置 gpt 系模型 + 手动输入均可用"
 
 
-def t19_model_cascade_500():
-    """站内模型级联：gpt-image-2 过载(500) -> 自动换本站 dall-e-3 成功。"""
-    s = start("model_down")
+def t19_model_500_unknown():
+    """A model's generic 500 cannot prove generation/charging never happened."""
+    server = start("model_down")
     wd = tempfile.mkdtemp()
     cfg = os.path.join(wd, "config.json")
-    write_config(cfg, [make_src_multi("cascade", s.server_address[1],
+    write_config(cfg, [make_src_multi("cascade", server.server_address[1],
                                       ["gpt-image-2", "dall-e-3"])])
     p = run([GEN, "generate", "--prompt-file", make_prompt(wd), "--name", "t19"], wd, cfg)
-    assert p.returncode == 0, p.stdout + p.stderr
-    assert "换本站下一个模型" in p.stdout, p.stdout
-    meta, _ = read_meta(wd)
-    att = meta["attempts"]
-    assert len(att) == 2, "应为 2 次尝试（同站两模型），实际 %d" % len(att)
-    assert att[0]["model"] == "gpt-image-2" and att[0]["ok"] is False and "500" in att[0]["error"]
-    assert att[1]["model"] == "dall-e-3" and att[1]["ok"] is True
-    assert meta["source"]["model"] == "dall-e-3"
-    return "500 时站内换模型成功（未换站），meta 记录模型级联"
+    assert p.returncode == 1, p.stdout + p.stderr
+    jobs = glob.glob(os.path.join(wd, "jobs", "*.json"))
+    assert len(jobs) == 1, jobs
+    with open(jobs[0], encoding="utf-8") as stream:
+        task = json.load(stream)
+    attempts = task["items"][0]["attempts"]
+    assert task["status"] == "unknown", task
+    assert len(attempts) == 1 and attempts[0]["model"] == "gpt-image-2", attempts
+    assert "500" in attempts[0]["error"] and attempts[0]["strategy"] == "unknown", attempts
+    assert len(server.requests) == 1, "500后不可自动切换本站第二模型"
+    assert not outputs(wd)[0], "未知结果不应伪造成功输出"
+    return "500记unknown，保留第一次请求并停止站内模型级联"
 
 
 def t20_model_cascade_404():
@@ -610,16 +624,16 @@ def main():
     print("failover-imagegen-tool 端到端验证（本地 mock 中转站，不访问外网）")
     print("=" * 62)
     tests = [
-        ("T1  500→b64 故障切换 + meta 尝试记录", t1_failover_500_to_b64),
-        ("T2  500→URL 响应模式 + 尺寸不一致标记", t2_failover_500_to_url),
+        ("T1  401→b64 安全切换 + meta 尝试记录", t1_failover_401_to_b64),
+        ("T2  401→URL 响应模式 + 尺寸不一致标记", t2_failover_401_to_url),
         ("T3  400 致命错误不换源", t3_fatal_400_no_failover),
         ("T4  No config found 引导", t4_no_config),
         ("T5  --list-sources 与密钥脱敏", t5_list_sources_masking),
         ("T6  尺寸别名 4k", t6_size_alias_4k),
         ("T7  默认尺寸 2560x1440", t7_default_size),
         ("T8  编辑模式 /images/edits", t8_edit_mode),
-        ("T9  错误消息密钥打码", t9_secret_masking_in_meta),
-        ("T10 图片下载失败切换源", t10_url_download_failover),
+        ("T9  错误消息密钥打码", t9_secret_masking_in_task),
+        ("T10 图片下载失败保留未知状态", t10_url_download_unknown),
         ("T11 401 密钥失效切换源", t11_auth401_failover),
         ("T12 连接拒绝（站点挂掉）切换源", t12_connection_refused_failover),
         ("T13 200 无图字段切换源", t13_noimage_then_success),
@@ -628,7 +642,7 @@ def main():
         ("T16 GUI 冒烟", t16_gui_smoke),
         ("T17 不覆盖/追加后缀与 --force", t17_force_overwrite_and_unique),
         ("T18 模型下拉框（预置+手输）", t18_gui_model_combobox),
-        ("T19 站内模型级联（500 换模型）", t19_model_cascade_500),
+        ("T19 500未知结果停止站内级联", t19_model_500_unknown),
         ("T20 站内模型级联（404 换模型）", t20_model_cascade_404),
         ("T21 模型发现过滤", t21_models_discovery),
         ("T22 健康体检+历史统计", t22_check_health_and_stats),
