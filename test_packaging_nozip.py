@@ -5,6 +5,7 @@ import marshal
 from pathlib import Path
 import struct
 import sys
+import sysconfig
 import tempfile
 import unittest
 from unittest import mock
@@ -35,6 +36,23 @@ def carchive(audit, entries):
 
 
 class NoZipPackagingTests(unittest.TestCase):
+    def test_zipimport_bytecode_with_empty_zip_constant_is_not_an_archive(self):
+        audit = module('packaging/runtime/nozip.py')
+        stdlib_source = (Path(sysconfig.get_path('stdlib')) / 'zipimport.py').read_text(encoding='utf-8')
+        payload = bytecode(filename='zipimport.py', source=stdlib_source)
+        self.assertFalse(audit.is_zip_payload(io.BytesIO(payload)))
+
+    def test_complete_bytecode_check_rejects_trailing_bytes_wrong_magic_and_non_code(self):
+        audit = module('packaging/runtime/nozip.py')
+        payload = bytecode(source='value = 1')
+        self.assertTrue(audit.is_complete_bytecode(io.BytesIO(payload)))
+        for invalid in (payload + b'trailing non-archive test data',
+                        b'FAKE' + payload[4:],
+                        payload[:16] + marshal.dumps('not a code object'),
+                        payload[:4] + b'\xff' * 4 + payload[8:]):
+            with self.subTest(prefix=invalid[:8]):
+                self.assertFalse(audit.is_complete_bytecode(io.BytesIO(invalid)))
+
     def test_zip_signatures_in_python_bytecode_are_not_archives(self):
         audit = module('packaging/runtime/nozip.py')
         sanitize = module('packaging/runtime/sanitize.py')
