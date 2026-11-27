@@ -11,9 +11,18 @@ import time
 import urllib.request
 from pathlib import Path
 
-PATH = Path(__file__).with_name('build_windows.py')
+PATH = Path(__file__).resolve().with_name('build_windows.py')
 
 class BuildTest(unittest.TestCase):
+    def test_inno_inputs_remain_absolute_when_ci_uses_relative_script_entry(self):
+        root = Path(__file__).resolve().parents[2]
+        script = "import runpy; print(runpy.run_path('packaging/windows/test_build_windows.py')['PATH'])"
+        result = subprocess.run([sys.executable, '-B', '-c', script], cwd=root,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(Path(result.stdout.strip()).is_absolute(),
+                        'Inno resolves relative resource paths against setup.iss, not the CI working directory')
+
     def test_prerelease_name_is_separate_from_numeric_windows_versions(self):
         version = runpy.run_path(str(PATH.parents[2] / 'version.py'))
         setup = PATH.with_name('setup.iss').read_text(encoding='utf-8')

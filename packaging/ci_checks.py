@@ -54,7 +54,8 @@ def run_tests(target, record):
     bootstrap = ('import faulthandler, os, runpy, sys; '
                  'faulthandler.enable(); faulthandler.dump_traceback_later(90, repeat=True); '
                  'sys.argv = sys.argv[1:]; '
-                 'sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0]))); '
+                 'sys.argv[0] = os.path.abspath(sys.argv[0]); '
+                 'sys.path.insert(0, os.path.dirname(sys.argv[0])); '
                  'runpy.run_path(sys.argv[0], run_name="__main__")')
     record['checks'] = []
     failures = []
