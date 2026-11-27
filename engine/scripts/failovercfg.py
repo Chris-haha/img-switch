@@ -25,6 +25,7 @@ import re
 import ssl
 import sys
 import tempfile
+import time
 import urllib.parse
 
 CONFIG_ENV = "FAILOVER_IMAGEGEN_TOOL_CONFIG"
@@ -97,43 +98,13 @@ class Config(dict):
 
 
 def shared_read(path):
-    """Open a binary snapshot without blocking atomic rename on Windows.
+    """Open a binary document; callers close it before parsing the snapshot.
 
-    The CRT's ordinary open() shares read/write access but not deletion, which
-    also covers rename. A GUI history reader must permit an engine's os.replace
-    while keeping its own consistent handle to the previous file contents.
+    Windows os.replace cannot replace an open destination, even when its handle
+    permits shared deletion (CPython issue46003). Keep reads short; atomic_write
+    waits briefly for competing readers instead of depending on sharing flags.
     """
-    if os.name != "nt":
-        return open(path, "rb")
-    import ctypes
-    from ctypes import wintypes
-    import msvcrt
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel.CreateFileW
-    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-                           wintypes.HANDLE)
-    create_file.restype = wintypes.HANDLE
-    close_handle = kernel.CloseHandle
-    close_handle.argtypes = (wintypes.HANDLE,)
-    close_handle.restype = wintypes.BOOL
-    # GENERIC_READ; SHARE_READ | SHARE_WRITE | SHARE_DELETE; OPEN_EXISTING.
-    # No DELETE access, DELETE_ON_CLOSE flag, or inheritable handle is requested.
-    handle = create_file(os.fsdecode(path), 0x80000000, 0x1 | 0x2 | 0x4,
-                         None, 3, 0x80, None)
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
-    except BaseException:
-        close_handle(handle)
-        raise
-    try:
-        return os.fdopen(fd, "rb")  # The returned stream now owns the handle.
-    except BaseException:
-        os.close(fd)
-        raise
+    return open(path, "rb")
 
 
 def atomic_write(path, data):
@@ -146,7 +117,21 @@ def atomic_write(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        deadline = time.monotonic() + 0.5
+        while True:
+            try:
+                os.replace(tmp, path)
+                break
+            except OSError as exc:
+                # MoveFileExW rejects an open target on Windows. Retry only the
+                # local atomic operation, with the same fsynced temporary file
+                # and any caller-held write lock. Never retry API requests.
+                if os.name != "nt" or getattr(exc, "winerror", None) not in (5, 32, 33):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise  # Permanent access denial remains visible unchanged.
+                time.sleep(min(0.01, remaining))
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

@@ -523,37 +523,111 @@ class EngineJobTests(unittest.TestCase):
                 with task_store.task_lock(str(self.jobs), ident):
                     pass
 
-    def test_shared_read_keeps_snapshot_while_atomic_replace_updates_path(self):
-        self.assertTrue(hasattr(failovercfg, 'shared_read'),
-                        'persistent JSON readers must permit atomic replacement')
+    def test_atomic_replace_updates_path_after_snapshot_closes(self):
         path = self.work / 'snapshot.json'
         original, updated = b'{"value": "before"}', b'{"value": "after"}'
         path.write_bytes(original)
         with failovercfg.shared_read(path) as reader:
-            failovercfg.atomic_write(str(path), updated)
-            self.assertEqual(reader.read(), original)
-            self.assertEqual(path.read_bytes(), updated)
+            snapshot = reader.read()
+        failovercfg.atomic_write(str(path), updated)
+        self.assertEqual(snapshot, original)
+        self.assertEqual(path.read_bytes(), updated)
 
-    @unittest.skipUnless(os.name == 'nt', 'Windows native read/delete sharing semantics')
-    def test_windows_plain_reader_blocks_replace_but_task_reader_does_not(self):
-        import task_store
-        path = self.work / 'plain-reader.json'
+    def test_windows_atomic_replace_retries_only_local_conflicts(self):
+        # Inject the native error on other platforms too; the second call still
+        # performs a real atomic replace, using the same staged bytes.
+        for code in (5, 32, 33):
+            with self.subTest(winerror=code):
+                path = self.work / ('sharing-%s.json' % code)
+                original, updated = b'before', b'after'
+                path.write_bytes(original)
+                conflict = PermissionError(13, 'simulated Windows sharing conflict')
+                conflict.winerror = code
+                real_replace = os.replace
+                attempts = []
+                def conflict_once(source, target):
+                    attempts.append((source, target))
+                    if len(attempts) == 1:
+                        self.assertEqual(Path(target).read_bytes(), original)
+                        raise conflict
+                    return real_replace(source, target)
+                windows_os = mock.Mock(wraps=os)
+                windows_os.name = 'nt'
+                windows_os.replace.side_effect = conflict_once
+                with mock.patch.object(failovercfg, 'os', windows_os):
+                    failovercfg.atomic_write(str(path), updated)
+                self.assertEqual(path.read_bytes(), updated)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(attempts[0], attempts[1])
+                self.assertEqual(list(self.work.glob('.img-switch-*.tmp')), [])
+        self.assertEqual(self.server.requests, [], 'retry only local file replacement')
+
+    def test_windows_atomic_replace_exhaustion_preserves_bytes_and_error(self):
+        path = self.work / 'permanent-denial.json'
+        path.write_bytes(b'before')
+        denied = PermissionError(13, 'simulated persistent permission denial')
+        denied.winerror = 5
+        windows_os = mock.Mock(wraps=os)
+        windows_os.name = 'nt'
+        windows_os.replace.side_effect = denied
+        started = time.monotonic()
+        with mock.patch.object(failovercfg, 'os', windows_os):
+            with self.assertRaises(PermissionError) as failure:
+                failovercfg.atomic_write(str(path), b'after')
+        self.assertIs(failure.exception, denied)
+        self.assertGreater(windows_os.replace.call_count, 1)
+        self.assertLess(time.monotonic() - started, 3, 'local retry must have a short bound')
+        self.assertEqual(path.read_bytes(), b'before')
+        self.assertEqual(list(self.work.glob('.img-switch-*.tmp')), [])
+        self.assertEqual(self.server.requests, [])
+
+    def test_atomic_replace_does_not_retry_other_os_errors(self):
+        for platform, code in (('posix', 5), ('nt', None), ('nt', 112)):
+            with self.subTest(platform=platform, winerror=code):
+                path = self.work / 'unrelated-error.json'
+                path.write_bytes(b'before')
+                error = OSError(13, 'not a native transient sharing error')
+                if code is not None:
+                    error.winerror = code
+                operating_system = mock.Mock(wraps=os)
+                operating_system.name = platform
+                operating_system.replace.side_effect = error
+                with mock.patch.object(failovercfg, 'os', operating_system):
+                    with self.assertRaises(OSError) as failure:
+                        failovercfg.atomic_write(str(path), b'after')
+                self.assertIs(failure.exception, error)
+                self.assertEqual(operating_system.replace.call_count, 1)
+                self.assertEqual(path.read_bytes(), b'before')
+                self.assertEqual(list(self.work.glob('.img-switch-*.tmp')), [])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows native target-handle replacement semantics')
+    def test_windows_atomic_replace_timeout_preserves_open_target(self):
+        path = self.work / 'held-reader.json'
         original = b'{"value": "before"}'
         path.write_bytes(original)
-        # Native before-case: the former ordinary read handle denies replacement.
-        with open(path, 'rb'):
-            with self.assertRaises(PermissionError) as conflict:
-                failovercfg.atomic_write(str(path), b'{"value": "after"}')
-            self.assertIn(conflict.exception.winerror, (5, 32))
+        real_replace = os.replace
+        with failovercfg.shared_read(path) as reader:
+            # A genuine open target blocks MoveFileExW, even with SHARE_DELETE.
+            with mock.patch.object(failovercfg.os, 'replace', wraps=real_replace) as replace:
+                with self.assertRaises(PermissionError) as conflict:
+                    failovercfg.atomic_write(str(path), b'{"value": "after"}')
+                self.assertIn(conflict.exception.winerror, (5, 32, 33))
+                self.assertGreater(replace.call_count, 1)
+            self.assertEqual(reader.read(), original)
             self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(self.work.glob('.img-switch-*.tmp')), [])
+        self.assertEqual(self.server.requests, [])
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows native target-handle replacement semantics')
+    def test_windows_journal_replace_waits_until_reader_releases_handle(self):
+        import task_store
         ident = str(uuid.uuid4())
         record = task_store.create_task(str(self.jobs), {
             'id': ident, 'name': 'before', 'status': 'queued', 'sources': [],
             'items': [{'id': '1', 'status': 'queued', 'prompt': 'local fixture'}]})
-        opened, release = threading.Event(), threading.Event()
+        opened, release, conflicted = threading.Event(), threading.Event(), threading.Event()
         results, failures = [], []
-        shared_read = failovercfg.shared_read
+        shared_read, real_replace = failovercfg.shared_read, os.replace
         reader_thread = None
 
         @contextlib.contextmanager
@@ -562,8 +636,15 @@ class EngineJobTests(unittest.TestCase):
                 if threading.current_thread() is reader_thread:
                     opened.set()
                     if not release.wait(4):
-                        raise RuntimeError('test writer did not finish')
+                        raise RuntimeError('test did not release the reader')
                 yield stream
+
+        def observe_replace(source, target):
+            try:
+                return real_replace(source, target)
+            except PermissionError:
+                conflicted.set()
+                raise
 
         def read_task():
             try:
@@ -571,17 +652,29 @@ class EngineJobTests(unittest.TestCase):
             except Exception as error:
                 failures.append(error)
 
-        with mock.patch.object(failovercfg, 'shared_read', hold_reader):
+        def write_task():
+            try:
+                record['name'] = 'after'
+                task_store.save_task(str(self.jobs), record)
+            except Exception as error:
+                failures.append(error)
+
+        with mock.patch.object(failovercfg, 'shared_read', hold_reader), \
+             mock.patch.object(failovercfg.os, 'replace', side_effect=observe_replace):
             reader_thread = threading.Thread(target=read_task)
+            writer_thread = threading.Thread(target=write_task)
             reader_thread.start()
             try:
                 self.assertTrue(opened.wait(3), 'reader did not acquire its real Windows handle')
-                record['name'] = 'after'
-                task_store.save_task(str(self.jobs), record)
+                writer_thread.start()
+                self.assertTrue(conflicted.wait(3), 'real replacement must encounter the held target')
             finally:
                 release.set()
                 reader_thread.join(5)
+                if writer_thread.ident is not None:
+                    writer_thread.join(5)
         self.assertFalse(reader_thread.is_alive())
+        self.assertFalse(writer_thread.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(results[0]['name'], 'before')
         self.assertEqual(task_store.load_task(str(self.jobs), ident)['name'], 'after')
