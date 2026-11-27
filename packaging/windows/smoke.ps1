@@ -8,7 +8,7 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('img-switch-smoke-' + [guid]::
 $appDir = Join-Path $testRoot 'Installed App'
 $homeDir = Join-Path $testRoot 'Test Home'
 $appDataDir = Join-Path $testRoot 'AppData'
-$pythonPath = (Get-Command python -ErrorAction Stop).Source
+$pythonPath = if ($env:PYTHON) { (Resolve-Path -LiteralPath $env:PYTHON -ErrorAction Stop).Path } else { (Get-Command python -ErrorAction Stop).Source }
 if (!$EvidenceDirectory) {
     $EvidenceDirectory = Join-Path (Split-Path -Parent $installerPath) ('windows-acceptance-' + [guid]::NewGuid().ToString('N'))
 }

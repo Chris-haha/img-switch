@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-GUI_HIDDEN_IMPORTS = ('failovercfg', 'task_store', 'image_decode', 'jpeg_entropy', 'argparse', 'glob', 'uuid', 'base64',
+GUI_HIDDEN_IMPORTS = ('failovercfg', 'task_store', 'image_decode', 'jpeg_entropy', 'tk_lifecycle', 'argparse', 'glob', 'uuid', 'base64',
                       'urllib.request', 'urllib.error', 'urllib.parse', 'json',
                       'time', 'socket')
 ENGINE_FILES = (
@@ -23,6 +23,7 @@ ENGINE_FILES = (
     'engine/scripts/image_decode.py',
     'engine/scripts/jpeg_entropy.py',
     'engine/scripts/setup.py',
+    'engine/scripts/tk_lifecycle.py',
 )
 APP_FILES = ('app.py', 'gui_tasks.py', 'version.py')
 

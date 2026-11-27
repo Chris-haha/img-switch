@@ -7,7 +7,7 @@ import shutil
 REQUIRED = ('app.py', 'gui_tasks.py', 'version.py', 'LICENSE', 'engine/SKILL.md',
             'engine/scripts/failovercfg.py', 'engine/scripts/failover_imagegen_tool.py',
             'engine/scripts/task_store.py', 'engine/scripts/image_decode.py', 'engine/scripts/jpeg_entropy.py',
-            'engine/scripts/setup.py')
+            'engine/scripts/setup.py', 'engine/scripts/tk_lifecycle.py')
 
 
 def stage(root, destination):

@@ -13,7 +13,7 @@ COMMON = ('app_tests.py', 'test_probe.py', 'test_reliability.py', 'test_engine_j
           'test_image_decode.py', 'test_gui_workflows.py', 'test_secret_redaction.py',
           'test_packaging_nozip.py', 'test_build_tools.py', 'test_packaged_runtime.py',
           'engine/tests/run_tests.py', 'engine/tests/test_user_agent.py',
-          'engine/tests/test_url_privacy.py', 'packaging/runtime/test_sanitize.py',
+          'engine/tests/test_url_privacy.py', 'engine/tests/test_legacy_gui_lifecycle.py', 'packaging/runtime/test_sanitize.py',
           'packaging/test_select_python.py', 'packaging/test_ci_release.py')
 
 

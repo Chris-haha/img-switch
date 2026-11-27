@@ -103,6 +103,7 @@ def cmd_gui(_args):
     try:
         import tkinter as tk
         from tkinter import messagebox, ttk
+        from tk_lifecycle import ManagedTk
     except ImportError:
         raise SystemExit(
             "当前 Python 没有 tkinter，无法启动图形界面。\n"
@@ -128,7 +129,7 @@ def cmd_gui(_args):
         "gpt-image-1", "gpt-image-1-mini", "dall-e-3", "dall-e-2",
     ]
 
-    class SetupApp(tk.Tk):
+    class SetupApp(ManagedTk):
         def __init__(self):
             super().__init__()
             self.title("中转站生图 · 源配置 — failover-imagegen-tool")

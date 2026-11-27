@@ -606,6 +606,10 @@ def cmd_gui(*, run_loop=True):
     from gui_tasks import (DetailDialog, TaskController, TaskHistoryPage,
                            TestImageDialog, merge_source_edit)
     from version import VERSION
+    script_dir = os.path.dirname(engine_script("tk_lifecycle.py"))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from tk_lifecycle import ManagedTk
 
     # ccswitch 风格设计系统：浅灰底 + 白卡片 + 橙色主按钮 + 绿色状态色
     C = {
@@ -1178,6 +1182,7 @@ def cmd_gui(*, run_loop=True):
             results = queue.Queue()
             button, model_box = self.fetch_btn, self.model_box
             headers = self.app.cfg_mod().api_headers(key)
+            mask_secrets = self.app.cfg_mod().mask_secrets
 
             def worker():
                 try:
@@ -1194,13 +1199,13 @@ def cmd_gui(*, run_loop=True):
                            if isinstance(it, dict) and isinstance(it.get("id"), str) and it["id"].strip()]
                     if len(ids) != len(data["data"]):
                         raise ValueError("模型列表含无效项目")
-                    ids = [self.app.cfg_mod().mask_secrets(value, [key])[:300] for value in ids]
+                    ids = [mask_secrets(value, [key])[:300] for value in ids]
                     hits = [i for i in ids if IMAGE_HINT.search(i)]
                     ordered = hits + [i for i in ids if i not in hits]
 
                     results.put((ordered, len(hits), None))
                 except Exception as e:  # noqa: BLE001
-                    results.put((None, 0, self.app.cfg_mod().mask_secrets(str(e), [key])[:300]))
+                    results.put((None, 0, mask_secrets(str(e), [key])[:300]))
 
             def finish():
                 if not button.winfo_exists():
@@ -1392,7 +1397,7 @@ def cmd_gui(*, run_loop=True):
     NAV = [("dashboard", "⏻", "Agent 接入"), ("sources", "⚙", "中转源"),
            ("history", "◷", "任务历史")]
 
-    class App(tk.Tk):
+    class App(ManagedTk):
         def __init__(self):
             super().__init__()
             self.title("IMG Switch")
@@ -1564,8 +1569,10 @@ def cmd_gui(*, run_loop=True):
             if self.tasks.active_ids():
                 self.set_status("正在取消任务；在途请求将保留为待核实状态", "off")
                 self.update_idletasks()
-            self.tasks.close()
             self.destroy()
+
+        def _before_tk_destroy(self):
+            self.tasks.close()
 
         def read_sources(self):
             try:

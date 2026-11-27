@@ -155,7 +155,13 @@ def upload(api, release_id, version, commit, target, package, evidence):
 
 
 def publish(api, release_id, version, commit):
-    release = owned_draft(api, release_id, commit)
+    release = api.request('/releases/' + str(release_id))
+    marker = '<!-- img-switch commit:' + commit + ' -->'
+    already_published = not release['draft']
+    if release.get('target_commitish') != commit or marker not in release.get('body', ''):
+        raise RuntimeError('Refusing to modify a published or unrelated release')
+    if already_published and release.get('tag_name') != 'v' + version:
+        raise RuntimeError('Refusing to modify a published or unrelated release')
     assets = {asset['name']: asset for asset in release['assets']}
     expected = {artifact_name(version, target) for target in PLATFORMS}
     expected |= {'verification-' + target + '.json' for target in PLATFORMS}
@@ -175,19 +181,25 @@ def publish(api, release_id, version, commit):
         if hashlib.sha256(binary).hexdigest() != artifact['sha256']:
             raise RuntimeError('Downloaded installer checksum mismatch')
         checksums.append(artifact['sha256'] + '  ' + name)
-    if api.request('/git/ref/tags/v' + version, missing_ok=True) is not None:
-        raise RuntimeError('Version tag appeared during verification; refusing overwrite')
     checksum_bytes = ('\n'.join(checksums) + '\n').encode()
     if 'SHA256SUMS.txt' in assets:
         previous = api.request('/releases/assets/' + str(assets['SHA256SUMS.txt']['id']), binary=True)
         if previous != checksum_bytes:
             raise RuntimeError('Existing checksum file differs; refusing overwrite')
+    elif already_published:
+        raise RuntimeError('Published release is missing its checksum file; no changes made')
     else:
         api.upload(release, 'SHA256SUMS.txt', checksum_bytes)
+    if already_published:
+        print('Verified existing published release ' + release['html_url'])
+        return
+    if api.request('/git/ref/tags/v' + version, missing_ok=True) is not None:
+        raise RuntimeError('Version tag appeared during verification; refusing overwrite')
     notes = (ROOT / 'docs/releases' / ('v' + version + '.md')).read_text(encoding='utf-8')
     notes += '\n\n原生验收：Windows x64、macOS Intel、macOS Apple Silicon。各平台 verification JSON 和 SHA256SUMS 随安装包提供。'
     notes += '\n\n验收源码：`' + commit + '`。'
     notes += '\n\n[完整构建与运行记录](https://github.com/' + api.repo + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + ')'
+    notes += '\n\n' + marker
     result = api.request('/releases/' + str(release_id), 'PATCH', value={
         'tag_name': 'v' + version, 'target_commitish': commit, 'name': 'IMG Switch v' + version + '（测试版）',
         'body': notes, 'draft': False, 'prerelease': True})

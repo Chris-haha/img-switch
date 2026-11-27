@@ -122,8 +122,10 @@ def open_path(path):
 class TaskController:
     """Processes belong to the app, never to a transient dialog."""
     def __init__(self, app, command, env, store_loader, jobs_dir):
-        self.app, self.command, self.env = app, command, env
-        self.store_loader, self.jobs_dir = store_loader, str(jobs_dir)
+        # Background collectors must retain only ordinary Python data, never a
+        # Tk app or a bound loader method that keeps its interpreter alive.
+        self.command, self.env = command, env
+        self.store, self.jobs_dir = store_loader(), str(jobs_dir)
         self.processes, self.logs = {}, {}
         self._cancel_threads = {}
         self._cancellations = {}
@@ -131,7 +133,7 @@ class TaskController:
         self._closed = False
 
     def records(self):
-        return self.store_loader().list_tasks(self.jobs_dir)
+        return self.store.list_tasks(self.jobs_dir)
 
     def get(self, task_id):
         return next((t for t in self.records() if t.get("id", t.get("task_id")) == task_id), None)

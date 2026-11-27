@@ -51,12 +51,62 @@ def read_url(address):
         return response.read()
 
 
+def select_document(requirement, rank):
+    """Respect exclusions, Python requirements and platform wheels before download."""
+    from pip._vendor.packaging.utils import parse_wheel_filename, canonicalize_name
+    from pip._vendor.packaging.version import Version, InvalidVersion
+    from pip._vendor.packaging.specifiers import SpecifierSet
+    current_python = Version('.'.join(map(str, sys.version_info[:3])))
+
+    def compatible(entries, requires_python=''):
+        if requires_python and current_python not in SpecifierSet(requires_python):
+            return []
+        result = []
+        for entry in entries:
+            if entry.get('yanked') or not entry['filename'].endswith('.whl'):
+                continue
+            supported = entry.get('requires_python')
+            if supported and current_python not in SpecifierSet(supported):
+                continue
+            _name, _version, _build, tags = parse_wheel_filename(entry['filename'])
+            matches = [rank[tag] for tag in tags if tag in rank]
+            if matches:
+                result.append((min(matches), entry))
+        return result
+
+    name = canonicalize_name(requirement.name)
+    exact = next((value.version for value in requirement.specifier if value.operator == '==' and '*' not in value.version), None)
+    address = 'https://pypi.org/pypi/' + name
+    document = json.loads(read_url(address + ('/' + exact if exact else '') + '/json'))
+    version = document['info']['version']
+    choices = compatible(document['urls'], document['info'].get('requires_python'))
+    if Version(version) in requirement.specifier and choices:
+        return document, min(choices, key=lambda item: item[0])[1]
+    index = document if 'releases' in document else json.loads(read_url(address + '/json'))
+    versions = []
+    for candidate in index['releases']:
+        try:
+            parsed = Version(candidate)
+        except InvalidVersion:
+            continue
+        if parsed in requirement.specifier:
+            versions.append((parsed, candidate))
+    for _parsed, candidate in sorted(versions, reverse=True):
+        if not compatible(index['releases'][candidate]):
+            continue
+        document = json.loads(read_url(address + '/' + candidate + '/json'))
+        choices = compatible(document['urls'], document['info'].get('requires_python'))
+        if choices:
+            return document, min(choices, key=lambda item: item[0])[1]
+    raise RuntimeError('No compatible published dependency selected: ' + name)
+
+
 def prepare(target, requirements=None):
     # pip is present in the supported build interpreters. Its already-installed
     # compatibility parser avoids bootstrapping another archive onto disk.
     try:
         from pip._vendor.packaging.requirements import Requirement
-        from pip._vendor.packaging.utils import parse_wheel_filename, canonicalize_name
+        from pip._vendor.packaging.utils import canonicalize_name
         from pip._vendor.packaging.tags import sys_tags
         from pip._vendor.packaging.version import Version
     except ImportError:
@@ -79,23 +129,8 @@ def prepare(target, requirements=None):
             if Version(installed[name]) not in requirement.specifier:
                 raise RuntimeError('Incompatible dependency versions: ' + name)
             continue
-        exact = next((value.version for value in requirement.specifier if value.operator == '=='), None)
-        address = 'https://pypi.org/pypi/' + name + ('/' + exact if exact else '') + '/json'
-        document = json.loads(read_url(address))
+        document, entry = select_document(requirement, rank)
         version = document['info']['version']
-        if Version(version) not in requirement.specifier:
-            raise RuntimeError('No compatible published dependency selected: ' + name)
-        candidates = []
-        for entry in document['urls']:
-            if not entry['filename'].endswith('.whl'):
-                continue
-            _name, _version, _build, compatible = parse_wheel_filename(entry['filename'])
-            matches = [rank[tag] for tag in compatible if tag in rank]
-            if matches:
-                candidates.append((min(matches), entry))
-        if not candidates:
-            raise RuntimeError('No compatible published wheel: ' + name)
-        entry = min(candidates, key=lambda item: item[0])[1]
         raw = read_url(entry['url'])
         digest = hashlib.sha256(raw).hexdigest()
         if digest != entry['digests']['sha256']:

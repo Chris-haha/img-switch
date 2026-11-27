@@ -115,6 +115,11 @@ class ReleaseGates(unittest.TestCase):
             release.publish(api, 1, VERSION, SHA)
         self.assertFalse(api.uploads)
         self.assertTrue(any(method == 'PATCH' for _, method, _ in api.calls))
+        api.release.update(draft=False, tag_name='v' + VERSION,
+                           html_url='https://github.com/owner/repository/releases/tag/v' + VERSION)
+        release.publish(api, 1, VERSION, SHA)
+        self.assertEqual(sum(method == 'PATCH' for _, method, _ in api.calls), 1)
+        self.assertFalse(api.uploads)
 
     def test_upload_refuses_archive_transport_and_existing_asset(self):
         api = release.GitHub.__new__(release.GitHub)

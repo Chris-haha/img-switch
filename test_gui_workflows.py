@@ -50,6 +50,71 @@ class GUIRelay(BaseHTTPRequestHandler):
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_destroyed_gui_can_be_collected_by_worker_without_tcl_access(self):
+        script = r'''
+import gc, threading, sys
+from test_reliability import GuiSafetyTests
+case = GuiSafetyTests("test_delete_before_edited_source_does_not_overwrite_next_source")
+case.debug()
+del case
+worker = threading.Thread(target=gc.collect)
+worker.start()
+worker.join(8)
+assert not worker.is_alive(), "destroyed Tk objects blocked worker garbage collection"
+print("worker collection clean")
+'''
+        result = subprocess.run([__import__("sys").executable, "-c", script],
+                                cwd=Path(__file__).parent, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Exception ignored", result.stderr)
+        self.assertIn("worker collection clean", result.stdout)
+
+    def test_closed_root_variables_dialogs_and_timers_are_safe_to_release_in_worker(self):
+        script = r'''
+import gc, threading, time
+import tkinter as tk
+from tkinter import font as tkfont, ttk
+from test_gui_workflows import NativeWorkflowTests
+gc.disable()
+case = NativeWorkflowTests()
+case.setUp()
+from tk_lifecycle import ManagedTk
+root = case.gui
+dialog = root.open_test_image(case.source["name"])
+variable = root.status
+font = tkfont.Font(root=root, family="Helvetica", size=10)
+image = tk.PhotoImage(master=root, width=1, height=1)
+style = ttk.Style(root)
+held = [root, dialog, variable, root.pages["sources"], font, image, style]
+root.after(40, lambda: print("ERROR: callback ran after close"))
+root.destroy()
+assert not root.winfo_exists()
+assert not dialog.winfo_exists()
+case.gui = None
+case.tearDown()
+del root, dialog, variable, font, image, style, case
+def collect():
+    held.clear()
+    gc.collect()
+worker = threading.Thread(target=collect)
+worker.start()
+worker.join(5)
+assert not worker.is_alive()
+# A fresh event loop must not run dangling callbacks from the old interpreter.
+next_root = ManagedTk()
+next_root.after(750, next_root.quit)
+next_root.mainloop()
+next_root.destroy()
+print("external references and timers clean")
+'''
+        result = subprocess.run([__import__("sys").executable, "-c", script],
+                                cwd=Path(__file__).parent, capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Exception ignored", result.stderr)
+        self.assertNotIn("invalid command name", result.stderr)
+        self.assertNotIn("ERROR:", result.stdout)
+        self.assertIn("external references and timers clean", result.stdout)
+
     def test_gui_can_be_embedded_without_starting_event_loop(self):
         self.assertIn("run_loop", inspect.signature(app.cmd_gui).parameters)
 
