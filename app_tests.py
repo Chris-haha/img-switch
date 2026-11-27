@@ -90,7 +90,7 @@ def t2_on_installs_to_existing_agents():
     zcode = os.path.join(home, ".zcode")
     assert not os.path.exists(zcode), ".zcode 不存在时不应被创建"
     s = run(["status"], home)
-    assert "已开启" in s.stdout and s.stdout.count("已接入") >= 3, s.stdout
+    assert "已开启" in s.stdout and s.stdout.count("技能可发现") >= 3, s.stdout
     return "on 安装到 .agents/.codex/.claude（.zcode 未存在则不建）"
 
 
@@ -213,9 +213,9 @@ def t10_gui_selftest_with_sources():
              "model": "m1"}, {"name": "Beta", "base_url": "http://b.example/v1",
              "api_key": "sk-2", "models": ["m2", "m3"]}]}, f)
     p = run(["gui"], home, timeout=60, extra_env={"FAILOVER_IMAGEGEN_APP_SELFTEST": "1"})
-    assert p.returncode == 0 and "app selftest ok（2 页面/Agent 卡 2 张/源页故障转移/源卡 3 张/设为首选/内嵌新增）" in (p.stdout or ""), \
+    assert p.returncode == 0 and "app selftest ok（3 页面/Agent 卡 2 张/源页故障转移/源卡 3 张/设为首选/内嵌新增）" in (p.stdout or ""), \
         "rc=%d out=%s err=%s" % (p.returncode, p.stdout, p.stderr)
-    return "界面自测：2 页面+Agent 卡 2 张（未装的不显示）+源页故障转移+源卡 3 张+设为首选+内嵌新增"
+    return "界面自测：3 页面+Agent 卡 2 张（未装的不显示）+源页故障转移+源卡 3 张+设为首选+内嵌新增"
 
 
 def t11_agent_selection():

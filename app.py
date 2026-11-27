@@ -3,8 +3,8 @@
 
 单窗口两页面（ccswitch 风格）：
   Agent 接入 只显示本机已安装的 Agent（.agents/.zcode/.codex/.claude/.cursor/
-           .trae-cn/.codebuddy/.mateclaw），每个独立开关，可只让部分 Agent 走
-           中转站生图（app-settings.json 记录排除名单）。
+           .trae-cn/.codebuddy/.mateclaw），按宿主管理技能发现与共享目录冲突
+           （app-settings.json 记录排除名单，Codex 使用原生禁用规则）。
   中转源   故障转移全局开关（开=失败自动切换下一源/模型；关=仅用★首选源）；
            配置管理（内嵌页面，不弹窗）：增删改、「参与生图」启停、★设为首选置顶、
            ▲▼调整后备顺序、站内多模型级联；模型下拉按当前 URL 实时获取；每源带「探测」。
@@ -14,6 +14,7 @@
 本机 HOME 隔离（测试）：FAILOVER_IMAGEGEN_APP_HOME=<目录>
 """
 import datetime
+import copy
 import filecmp
 import importlib.util
 import json
@@ -30,6 +31,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
 
 APP_NAME = "failover-imagegen-app"
 SKILL_NAME = "failover-imagegen-tool"
@@ -37,7 +42,7 @@ MARKER = ".installed-by-app"
 # (宿主目录, 说明)——.agents 为跨工具标准目录，始终安装；其余仅当宿主目录存在时安装
 # 宿主目录即「该 Agent 的用户级 skills 目录」的父目录（~/.<host>/skills/）
 AGENT_HOSTS = [
-    (".agents", "跨工具标准 / ZCode"),
+    (".agents", "共享技能 / ZCode"),
     (".zcode", "ZCode"),
     (".codex", "Codex"),
     (".claude", "Claude Code"),
@@ -58,9 +63,20 @@ def probe_relay(base, headers):
     t0 = time.monotonic()
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=12):
-                pass
-            return '✓ %dms' % int((time.monotonic() - t0) * 1000), '模型接口响应正常', True
+            with urllib.request.urlopen(req, timeout=12) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeError):
+                data = None
+            if (len(raw) > 2 * 1024 * 1024 or not isinstance(data, dict)
+                    or not isinstance(data.get('data'), list)
+                    or not all(isinstance(item, dict) and isinstance(item.get('id'), str)
+                               and item['id'].strip() for item in data['data'])):
+                return '△ 响应格式错误', '地址可达，但未返回有效模型列表；尚未验证出图', False
+            if not data['data']:
+                return '△ 模型列表为空', '模型接口未返回可用模型；尚未验证出图', False
+            return '✓ %dms' % int((time.monotonic() - t0) * 1000), '模型列表有效；尚未验证出图能力', True
         except urllib.error.HTTPError as error:
             if error.code == 401:
                 return '✗ 鉴权失败', '模型接口返回 HTTP 401，请检查密钥', False
@@ -130,9 +146,96 @@ def _is_our_skill(dst):
 
 
 def host_hooked(host):
-    """该 Agent 当前是否已接入（装有本 skill）。"""
-    dst = skill_dst(host)
-    return os.path.isdir(dst) and _is_our_skill(dst)
+    """Known discovery locations, including shared copies and Codex exclusions."""
+    for visible in discovery_hosts(host):
+        dst = skill_dst(visible)
+        if os.path.isfile(os.path.join(dst, "SKILL.md")):
+            if host == ".codex" and not codex_skill_enabled(os.path.join(dst, "SKILL.md")):
+                continue
+            return True
+    return False
+
+
+def discovery_hosts(host):
+    if host == ".codex":
+        return (".codex", ".agents")
+    if host == ".cursor":
+        return (".cursor", ".agents", ".claude", ".codex")
+    return (host,)
+
+
+def _read_codex_config():
+    path = os.path.join(home(), ".codex", "config.toml")
+    if not os.path.exists(path):
+        return path, b"", {}
+    if tomllib is None:
+        raise RuntimeError("管理 Codex 技能开关需要 Python 3.11+；请使用新版运行环境或安装包")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        return path, raw, tomllib.loads(raw.decode("utf-8"))
+    except (ValueError, OSError) as error:
+        # A TOML parser error may contain secret values, so do not echo it.
+        raise RuntimeError("Codex 配置无法读取，已停止操作并保留原文件：" + path) from None
+
+
+def codex_skill_enabled(skill_path):
+    try:
+        _path, _raw, document = _read_codex_config()
+        rules = document.get("skills", {}).get("config", [])
+        enabled = True
+        for rule in rules:
+            if (rule.get("name") == SKILL_NAME or
+                    rule.get("path") == os.path.abspath(skill_path)):
+                enabled = rule.get("enabled", True)
+        return bool(enabled)
+    except (RuntimeError, AttributeError, TypeError):
+        return False  # Do not claim enabled when the host configuration is invalid.
+
+
+def set_codex_skill_enabled(enabled):
+    """Maintain one native name exclusion, preserving unrelated TOML and comments."""
+    module = load_engine_module("failovercfg.py", "_img_switch_config_io")
+    path = os.path.join(home(), ".codex", "config.toml")
+    with module.config_lock(path):
+        _write_codex_skill_policy(enabled, module)
+
+
+def _write_codex_skill_policy(enabled, module):
+    if tomllib is None:
+        raise RuntimeError("管理 Codex 技能开关需要 Python 3.11+；请使用新版运行环境或安装包")
+    path, raw, _document = _read_codex_config()
+    begin = "# BEGIN IMG SWITCH SKILL POLICY"
+    end = "# END IMG SWITCH SKILL POLICY"
+    text = raw.decode("utf-8")
+    if text.count(begin) != text.count(end) or text.count(begin) > 1:
+        raise RuntimeError("Codex 中的 IMG Switch 配置段不完整，请检查 config.toml；原文件已保留")
+    if begin in text:
+        text, count = re.subn(r"(?m)^" + re.escape(begin) + r"\r?\n.*?^" + re.escape(end) + r"(?:\r?\n|$)",
+                             "", text, flags=re.DOTALL)
+        if count != 1:
+            raise RuntimeError("Codex 中的 IMG Switch 配置段无法识别；原文件已保留")
+    separator = "" if not text or text.endswith("\n") else "\n"
+    policy = (separator + begin + '\n[[skills.config]]\nname = "' + SKILL_NAME + '"\nenabled = ' +
+              str(bool(enabled)).lower() + '\n' + end + '\n')
+    updated = text + policy
+    try:
+        tomllib.loads(updated)
+    except ValueError:
+        raise RuntimeError("Codex 配置结构不支持追加技能规则，请检查 skills.config；原文件已保留") from None
+    if updated.encode("utf-8") == raw:
+        return
+    backup = path + ".img-switch-backup"
+    if raw and not os.path.exists(backup):
+        # Private backup, created only once, never overwrite an existing backup.
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            if f.read() != raw:
+                raise RuntimeError("Codex 配置已被其他程序修改，请重试；未写入更改")
+    module.atomic_write(path, updated.encode("utf-8"))
 
 
 def is_on():
@@ -152,15 +255,17 @@ def load_app_settings():
             doc = json.load(f)
         if isinstance(doc, dict):
             return doc
+        raise ValueError("settings must be an object")
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
-        pass
-    return {}
+        raise RuntimeError("接入设置无法读取，已停止操作并保留原文件：" + app_settings_path()) from None
 
 
 def save_app_settings(doc):
-    os.makedirs(appdata_dir(), exist_ok=True)
-    with open(app_settings_path(), "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2)
+    load_app_settings()  # Do not overwrite a damaged exclusion list.
+    module = load_engine_module("failovercfg.py", "_img_switch_settings_io")
+    module.atomic_write(app_settings_path(), json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
 def host_disabled(host):
@@ -207,7 +312,7 @@ def _migrate_local_config():
 
 def _backup_local_configs(dst):
     """Preserve legacy local secrets before replacing or removing a managed skill."""
-    for filename in ("config.json", "config.json.tmp"):
+    for filename in ("config.json", "config.json.tmp", "config.json.backup"):
         source = os.path.join(dst, filename)
         if not os.path.isfile(source):
             continue
@@ -251,12 +356,21 @@ def _prepare_packaged_skill(path):
         f.write(text)
 
 
-def install_skill(hosts=None):
+def install_skill(hosts=None, manage_policy=True):
     """安装到指定宿主集合；hosts=None 表示全部「未被排除」的已检测 Agent。"""
     src = engine_dir()
     if not os.path.isfile(os.path.join(src, "SKILL.md")):
         raise RuntimeError("引擎目录不完整：%s" % src)
     _migrate_local_config()
+    selected = [h for h, _l, _r, a in agent_targets()
+                if a and ((hosts is None and not host_disabled(h)) or (hosts is not None and h in hosts))]
+    shared_for_cursor = set(discovery_hosts(".cursor")) - {".cursor"}
+    if (manage_policy and os.path.isdir(os.path.join(home(), ".cursor"))
+            and host_disabled(".cursor") and ".cursor" not in selected
+            and shared_for_cursor.intersection(selected)):
+        raise RuntimeError("Cursor 已被设为不接入；安装共享技能会被 Cursor 再次发现。请先明确开启 Cursor 接入，再安装共享技能；现有安装未改动。")
+    if manage_policy and ".codex" in selected:
+        _read_codex_config()  # Validate before replacing an installed skill.
     installed = []
     for host, _label, root, active in agent_targets():
         if not active:
@@ -278,7 +392,7 @@ def install_skill(hosts=None):
         committed = False
         try:
             shutil.copytree(src, staged, ignore=shutil.ignore_patterns(
-                "__pycache__", "config.json", "config.json.tmp", "*.pyc"))
+                "__pycache__", "config.json", "config.json.tmp", "config.json.backup", "config.json.lock", ".img-switch-*", "*.pyc"))
             _prepare_packaged_skill(staged)
             with open(os.path.join(staged, MARKER), "w", encoding="utf-8") as f:
                 f.write("installed-by %s at %s\n" % (APP_NAME, datetime.datetime.now().isoformat()))
@@ -301,6 +415,10 @@ def install_skill(hosts=None):
             if committed or not os.path.lexists(backup):
                 shutil.rmtree(work, ignore_errors=True)
         installed.append(dst)
+        if manage_policy and host == ".codex":
+            set_codex_skill_enabled(True)
+    if manage_policy and ".agents" in selected and os.path.isdir(os.path.join(home(), ".codex")) and host_disabled(".codex"):
+        set_codex_skill_enabled(False)
     return installed
 
 
@@ -312,13 +430,13 @@ def sync_connected_skills():
         return []  # Source installations have no bundled runtime to propagate.
     failures = []
     for host, _label, _root, active in agent_targets():
-        if not active or host_disabled(host) or not host_hooked(host):
+        if not active or host_disabled(host) or not _is_our_skill(skill_dst(host)):
             continue
         try:
             with tempfile.TemporaryDirectory(prefix="img-switch-compare-") as work:
                 expected = os.path.join(work, "expected")
                 shutil.copytree(source, expected, ignore=shutil.ignore_patterns(
-                    "__pycache__", "config.json", "config.json.tmp", "*.pyc"))
+                    "__pycache__", "config.json", "config.json.tmp", "config.json.backup", "config.json.lock", ".img-switch-*", "*.pyc"))
                 _prepare_packaged_skill(expected)
                 destination = skill_dst(host)
                 current = True
@@ -332,7 +450,7 @@ def sync_connected_skills():
                             break
                     if not current:
                         break
-                if not current and not install_skill([host]):
+                if not current and not install_skill([host], manage_policy=False):
                     raise RuntimeError("未能更新已接入的技能")
         except Exception as error:  # noqa: BLE001
             failures.append((host, type(error).__name__))
@@ -342,6 +460,16 @@ def sync_connected_skills():
 def remove_skill(hosts=None):
     """移除指定宿主集合的本 skill；hosts=None 表示全部（安全兜底，off 用）。"""
     _migrate_local_config()
+    targets = set(hosts) if hosts is not None else {h for h, _l in AGENT_HOSTS}
+    if ".cursor" in targets and os.path.isdir(os.path.join(home(), ".cursor")):
+        remaining = [h for h in discovery_hosts(".cursor") if h != ".cursor"
+                     and os.path.isfile(os.path.join(skill_dst(h), "SKILL.md"))
+                     and (h not in targets or not _is_our_skill(skill_dst(h)))]
+        if remaining:
+            raise RuntimeError("Cursor 仍会读取 %s 中的共享技能，无法单独断开。请先关闭对应接入，或在 Cursor 中管理该技能；其他 Agent 未改动。"
+                               % "、".join(remaining))
+    if ".codex" in targets and os.path.isdir(os.path.join(home(), ".codex")):
+        set_codex_skill_enabled(False)
     removed = []
     for host, _label, _root, active in agent_targets():
         if not active:
@@ -421,7 +549,7 @@ def cmd_on():
     excluded = [l for h, l, _r, a in agent_targets() if a and host_disabled(h)]
     if excluded:
         print("已按设置排除：%s（在界面「总开关」页可单独接入）" % "、".join(excluded))
-    print("开启完成：已接入的 Agent 在任意项目下可对话触发生图；"
+    print("接入完成：技能已安装；是否调用由 Agent 决定，已有会话可能需要重启。"
           "配置统一保存在 %s" % appdata_config())
     if not os.path.isfile(appdata_config()):
         print("（尚未配置中转源：运行 python \"%s\" gui 配置）" % os.path.abspath(__file__))
@@ -435,8 +563,8 @@ def cmd_off():
     removed = remove_skill()
     for d in removed:
         print("  ✓ 已移除：%s" % d)
-    print("关闭完成：本机已恢复原状（各 Agent 用回自己套餐的生图能力）。"
-          "配置保留在 %s，重新 on 即恢复。" % appdata_config())
+    print("关闭操作完成：已移除本软件管理的技能，并设置 Codex 原生禁用规则；已有会话请重启。"
+          "用户自行安装的技能不受本软件移除。配置保留在 %s。" % appdata_config())
     return 0
 
 
@@ -456,8 +584,10 @@ def cmd_status():
         dst = skill_dst(host)
         if not active:
             print("  — %-8s 未检测到该 Agent（宿主目录 %s 不存在）" % (label, host))
-        elif os.path.isdir(dst) and _is_our_skill(dst):
-            print("  ✓ %-8s 已接入 %s" % (label, dst))
+        elif host_hooked(host):
+            visible = [h for h in discovery_hosts(host)
+                       if os.path.isfile(os.path.join(skill_dst(h), "SKILL.md"))]
+            print("  ✓ %-8s 技能可发现：%s（是否调用由 Agent 决定）" % (label, "、".join(visible)))
         elif host_disabled(host):
             print("  ✗ %-8s 已按设置排除（界面「总开关」页可接入）" % label)
         else:
@@ -467,12 +597,20 @@ def cmd_status():
 
 # ---------------------------------------------------------------- GUI
 
-def cmd_gui():
+def cmd_gui(*, run_loop=True):
     try:
         import tkinter as tk
         from tkinter import messagebox, ttk
     except ImportError:
         raise SystemExit("当前 Python 缺少 tkinter，请改用 CLI：python app.py on/off/status")
+    from gui_tasks import (DetailDialog, TaskController, TaskHistoryPage,
+                           TestImageDialog, merge_source_edit)
+    from version import VERSION
+    script_dir = os.path.dirname(engine_script("tk_lifecycle.py"))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from tk_lifecycle import ManagedTk
+    from failovercfg import shared_read
 
     # ccswitch 风格设计系统：浅灰底 + 白卡片 + 橙色主按钮 + 绿色状态色
     C = {
@@ -538,20 +676,23 @@ def cmd_gui():
         bar = tk.Frame(page, bg=C["bg"])
         bar.pack(fill="x", pady=(2, 10))
         box = tk.Frame(bar, bg=C["bg"])
-        box.pack(side="left")
+        bar.columnconfigure(0, weight=1)
+        box.grid(row=0, column=0, sticky="w")
         tk.Label(box, text=title, bg=C["bg"], fg=C["text"], font=FONT_TITLE,
                  anchor="w").pack(anchor="w")
         if subtitle:
-            tk.Label(box, text=subtitle, bg=C["bg"], fg=C["muted"], font=FONT_SM,
-                     anchor="w").pack(anchor="w")
+            caption = tk.Label(bar, text=subtitle, bg=C["bg"], fg=C["muted"], font=FONT_SM,
+                               anchor="w", justify="left")
+            caption.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+            bar.bind("<Configure>", lambda e: caption.config(wraplength=max(300, e.width - 8)))
         right = tk.Frame(bar, bg=C["bg"])
-        right.pack(side="right")
+        right.grid(row=0, column=1, sticky="e", padx=(12, 0))
         return right
 
     def failover_now():
         """读 config.json 顶层 failover（默认 True）。"""
         try:
-            with open(appdata_config(), "r", encoding="utf-8") as f:
+            with shared_read(appdata_config()) as f:
                 return bool(json.load(f).get("failover", True))
         except (OSError, ValueError):
             return True
@@ -654,7 +795,7 @@ def cmd_gui():
             self.cover_rows = []
             self.agent_switches = []
             page_top(self, "Agent 接入",
-                     "每个 Agent 独立接入/断开；本机未安装的 Agent 不显示")
+                     "管理技能接入；共享目录可能影响多个 Agent，已有会话请重启后确认")
             head = tk.Frame(self, bg=C["bg"])
             head.pack(fill="x", pady=(8, 6))
             tk.Label(head, text="本机检测到的 Agent", bg=C["bg"], fg=C["muted"],
@@ -692,13 +833,17 @@ def cmd_gui():
                 if hooked:
                     hooked_n += 1
                 if hooked:
-                    note, fg = "已接入：对话生图走中转站", C["ok"]
+                    visible = [h for h in discovery_hosts(host)
+                               if os.path.isfile(os.path.join(skill_dst(h), "SKILL.md"))]
+                    note, fg = "技能可发现：%s；是否调用由 Agent 决定" % "、".join(visible), C["ok"]
+                    if host == ".cursor" and any(h != host for h in visible):
+                        note, fg = "共享技能生效；无法单独关闭。是否调用由 Cursor 决定。", C["warn"]
                 elif host_disabled(host):
-                    note, fg = "已排除：保持该 Agent 原生生图", C["muted"]
+                    note, fg = "已断开；Codex 规则变化后请重启会话" if host == ".codex" else "本软件管理的技能未接入", C["muted"]
                 else:
                     note, fg = "未接入：点右侧开关接入", C["muted"]
                 tk.Label(info, text=note, bg=C["card"], fg=fg, anchor="w",
-                         font=FONT_SM).pack(anchor="w")
+                         font=FONT_SM, wraplength=420, justify="left").pack(anchor="w")
                 sw = Switch(inner, lambda on, h=host: self.app.toggle_host(h, on),
                             width=40, height=22)
                 sw.set_state(hooked, animate=False)
@@ -713,6 +858,7 @@ def cmd_gui():
         def __init__(self, master, app):
             super().__init__(master, app)
             self.editing_index = None
+            self._editing_source = None
             self._form_visible = False
             self._key_visible = False
             self._card_refs = []
@@ -732,10 +878,9 @@ def cmd_gui():
             self.fai_switch.pack(side="left", padx=(14, 12), pady=10)
             tk.Label(fai, text="故障转移", bg=C["card"], fg=C["text"],
                      font=FONT_BOLD).pack(side="left")
-            tk.Label(fai, text="开：当前源/模型失败自动切换下一个重试 ｜ "
-                               "关：只用★首选源，失败直接报错",
-                     bg=C["card"], fg=C["muted"], font=FONT_SM).pack(
-                side="left", padx=(12, 0))
+            explanation = tk.Label(fai, text="开：明确失败时尝试下一源/模型；结果未知时停止等待核实。\n关：只使用★首选源。",
+                                  bg=C["card"], fg=C["muted"], font=FONT_SM, justify="left")
+            explanation.pack(side="left", padx=(12, 8))
 
             self.scroll = ScrollBox(self)
             self.scroll.pack(fill="both", expand=True)
@@ -760,13 +905,29 @@ def cmd_gui():
         def _cfg(self):
             try:
                 return self.app.cfg_mod().load_config(appdata_config()) \
-                    or {"version": 1, "sources": []}
+                    or self.app.cfg_mod().default_config()
             except RuntimeError as e:
                 messagebox.showerror("配置错误", str(e), parent=self)
-                return {"version": 1, "sources": []}
+                return None
 
         def _save(self, cfg):
-            self.app.cfg_mod().save_config(cfg, appdata_config())
+            try:
+                self.app.cfg_mod().save_config(cfg, appdata_config())
+                return True
+            except (RuntimeError, OSError) as e:
+                messagebox.showerror("无法保存", str(e), parent=self)
+                self.app.set_status("保存失败，原配置已保留", "off")
+                return False
+
+        def _card_is_current(self, cfg, i):
+            if cfg is None or not 0 <= i < len(cfg["sources"]):
+                return False
+            if (i >= len(self._listed_sources) or
+                    cfg["sources"][i] != self._listed_sources[i]):
+                messagebox.showerror("列表已变化", "中转源已被其他窗口修改，请刷新后重新操作；本次未修改配置。", parent=self)
+                self.refresh()
+                return False
+            return True
 
         # ---- 渲染 ----
         def update_failover_ui(self):
@@ -779,10 +940,16 @@ def cmd_gui():
                 w.destroy()
             self._card_refs = []
             cfg = self._cfg()
+            self._listed_sources = copy.deepcopy(cfg["sources"]) if cfg is not None else []
+            if cfg is None:
+                tk.Label(self.scroll.inner, text="配置无法读取，已停止写入。请修复配置文件后重新打开页面。",
+                         bg=C["card"], fg=C["danger"], wraplength=580, pady=20).pack(fill="x")
+                self.btn_new.config(state="disabled")
+                return
             sources = cfg["sources"]
-            if self.editing_index is not None and self.editing_index >= len(sources):
-                self.editing_index = None
-                self._form_visible = False
+            if self._editing_source is not None:
+                self.editing_index = next((i for i, s in enumerate(sources)
+                                           if s["name"] == self._editing_source["name"]), self.editing_index)
             if self._form_visible:
                 self._build_form()
             first_on = self.app.cfg_mod().prefer_index(cfg)
@@ -808,7 +975,8 @@ def cmd_gui():
             row.pack(fill="x", padx=12, pady=8)
             # 左侧排序导轨：▲▼（到边界时置灰不可点）
             rail = tk.Frame(row, bg=bg)
-            rail.pack(side="left", padx=(0, 8))
+            row.columnconfigure(2, weight=1)
+            rail.grid(row=0, column=0, padx=(0, 8), sticky="n")
             if i > 0:
                 flat_btn(rail, "▲", lambda idx=i: self._move(idx, -1),
                          padx=3, pady=1, font=("Microsoft YaHei UI", 8)).pack()
@@ -822,13 +990,14 @@ def cmd_gui():
                 tk.Label(rail, text="▼", bg=bg, fg=C["line"],
                          font=("Microsoft YaHei UI", 8)).pack(pady=1)
             avatar(row, s["name"][:1].upper(), SRC_COLORS[i % len(SRC_COLORS)],
-                   bg=bg).pack(side="left", padx=(0, 10))
+                   bg=bg).grid(row=0, column=1, padx=(0, 10), sticky="n")
             info = tk.Frame(row, bg=bg)
-            info.pack(side="left")
+            info.grid(row=0, column=2, sticky="nsew")
+            name_label = tk.Label(info, text=self.app.safe_text(s["name"], 160), bg=bg, fg=C["text"],
+                                 font=FONT_BOLD, anchor="w", justify="left")
+            name_label.pack(fill="x")
             line1 = tk.Frame(info, bg=bg)
             line1.pack(anchor="w")
-            tk.Label(line1, text=s["name"], bg=bg, fg=C["text"],
-                     font=FONT_BOLD).pack(side="left")
             if prefer:
                 tk.Label(line1, text="★ 首选", bg=bg, fg=C["ok"],
                          font=FONT_BOLD).pack(side="left", padx=(10, 0))
@@ -844,20 +1013,42 @@ def cmd_gui():
                       cursor="hand2")
             en.bind("<Button-1>", lambda e, idx=i: self._toggle_enabled_at(idx))
             en.pack(side="left", padx=(8, 0))
-            tk.Label(info, text="%s  ｜  %s" % (m.endpoint_host(s["base_url"]),
-                                                m.models_display(s)),
-                     bg=bg, fg=C["muted"], font=FONT_SM, anchor="w").pack(anchor="w")
+            models = m.source_models(s)
+            summary_label = tk.Label(info, text=self.app.safe_text("%s · %d 个模型 · %s" % (
+                m.endpoint_host(s["base_url"]), len(models), models[0] if models else "未配置"), 140),
+                bg=bg, fg=C["muted"], font=FONT_SM, anchor="w", justify="left")
+            summary_label.pack(fill="x", pady=(3, 0))
+            def fit(event):
+                name_label.config(wraplength=max(100, event.width - 8))
+                summary_label.config(wraplength=max(100, event.width - 8))
+            info.bind("<Configure>", fit)
             tail = tk.Frame(row, bg=bg)
-            tail.pack(side="right")
+            tail.grid(row=0, column=3, sticky="ne", padx=(10, 0))
             probe_lbl = tk.Label(tail, text="", bg=bg, fg=C["muted"], font=FONT_SM)
-            probe_lbl.pack(side="left", padx=(0, 6))
+            probe_lbl.pack(anchor="e")
+            primary_ops = tk.Frame(tail, bg=bg)
+            primary_ops.pack(anchor="e")
+            flat_btn(primary_ops, "模型详情", lambda source=copy.deepcopy(s): self._model_details(source),
+                     bg=bg, padx=5).pack(side="left")
+            flat_btn(primary_ops, "测试出图", lambda name=s["name"]: self.app.open_test_image(name),
+                     bg=bg, fg=C["primary"], padx=5).pack(side="left")
             ops = tk.Frame(tail, bg=bg)
-            ops.pack(side="left")
+            ops.pack(anchor="e")
             flat_btn(ops, "探测", lambda idx=i, lbl=probe_lbl: self._probe(idx, lbl),
                      bg=bg).pack(side="left")
             flat_btn(ops, "编辑", lambda idx=i: self._edit(idx), bg=bg).pack(side="left")
             flat_btn(ops, "删除", lambda idx=i: self._remove(idx),
                      fg=C["danger"], bg=bg).pack(side="left")
+
+        def _model_details(self, source):
+            lines = ["中转源：" + source["name"],
+                     "接口：" + self.app.cfg_mod().endpoint_host(source["base_url"]), "", "配置的生图模型："]
+            lines.extend(self.app.cfg_mod().source_models(source))
+            lines.extend(["", "能力设置（以中转源实际支持为准）："])
+            capabilities = {k: v for k, v in source.items() if k not in
+                            ("name", "base_url", "api_key", "model", "models", "enabled")}
+            lines.append(json.dumps(capabilities, ensure_ascii=False, indent=2) if capabilities else "未声明额外能力；可通过测试出图验证。")
+            return DetailDialog(self, "模型详情", self.app.safe_text("\n".join(lines), 100000))
 
         # ---- 内嵌编辑卡（新增/编辑共用，保存后收起） ----
         def _build_form(self):
@@ -874,11 +1065,9 @@ def cmd_gui():
                  C["warn"] if editing else C["primary"],
                  C["warn_light"] if editing else C["primary_light"], padx=8).pack(
                 side="left", padx=(10, 0))
-            fields = (("名称（如 example-source）", "name"),
-                      ("Base URL（通常以 /v1 结尾）", "base_url"),
-                      ("API Key（只保存在本机）", "api_key"),
-                      ("生图模型（可逗号分隔多个，依次级联）", "model"),
-                      ("超时秒数（可空，默认 300）", "timeout"))
+            fields = (("名称", "name"), ("Base URL（以 /v1 结尾）", "base_url"),
+                      ("API Key", "api_key"), ("模型（多个用逗号分隔）", "model"),
+                      ("请求超时（秒，默认 300）", "timeout"))
             grid = tk.Frame(card, bg=C["card"])
             grid.pack(fill="x", padx=16, pady=(6, 0))
             grid.columnconfigure(1, weight=1)
@@ -923,8 +1112,9 @@ def cmd_gui():
                        command=self._save_form).pack(side="left")
             ttk.Button(bar, text="取消", command=self.close_form).pack(
                 side="left", padx=(10, 0))
-            tk.Label(bar, text="API Key 保存在本机；请求时会发送给配置的中转源",
-                     bg=C["card"], fg=C["light"], font=FONT_SM).pack(side="right")
+            tk.Label(card, text="API Key 保存在本机；请求时发送给配置的中转源。已有能力设置在编辑后保留。",
+                     bg=C["card"], fg=C["light"], font=FONT_SM, anchor="w", wraplength=540,
+                     justify="left").pack(fill="x", padx=16, pady=(0, 12))
 
         def _render_enabled(self):
             if self.enabled.get():
@@ -946,7 +1136,7 @@ def cmd_gui():
         # ---- 探测（原体检页能力，收进每张源卡） ----
         def _probe(self, i, label):
             cfg = self._cfg()
-            if i >= len(cfg["sources"]):
+            if not self._card_is_current(cfg, i):
                 return
             s = cfg["sources"][i]
             label.config(text="探测中…", fg=C["muted"])
@@ -989,25 +1179,34 @@ def cmd_gui():
                 self.app.set_status("请先填写 Base URL 和 API Key，再点「⟳ 获取」", "off")
                 return
             self.fetch_btn.config(text="获取中…", fg=C["muted"])
-            self.app.set_status("正在查询 %s/models …" % base, "off")
+            self.app.set_status("正在查询 %s 的模型列表…" % self.app.cfg_mod().endpoint_host(base), "off")
             results = queue.Queue()
             button, model_box = self.fetch_btn, self.model_box
             headers = self.app.cfg_mod().api_headers(key)
+            mask_secrets = self.app.cfg_mod().mask_secrets
 
             def worker():
                 try:
                     req = urllib.request.Request(
                         base + "/models", headers=headers)
                     with urllib.request.urlopen(req, timeout=15) as resp:
-                        data = json.loads(resp.read().decode("utf-8", "replace"))
-                    ids = [str(it["id"]) for it in (data.get("data") or [])
-                           if isinstance(it, dict) and it.get("id")]
+                        raw = resp.read(2 * 1024 * 1024 + 1)
+                    if len(raw) > 2 * 1024 * 1024:
+                        raise ValueError("模型列表响应过大")
+                    data = json.loads(raw.decode("utf-8", "replace"))
+                    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+                        raise ValueError("服务端未返回有效模型列表")
+                    ids = [it["id"] for it in (data.get("data") or [])
+                           if isinstance(it, dict) and isinstance(it.get("id"), str) and it["id"].strip()]
+                    if len(ids) != len(data["data"]):
+                        raise ValueError("模型列表含无效项目")
+                    ids = [mask_secrets(value, [key])[:300] for value in ids]
                     hits = [i for i in ids if IMAGE_HINT.search(i)]
                     ordered = hits + [i for i in ids if i not in hits]
 
                     results.put((ordered, len(hits), None))
                 except Exception as e:  # noqa: BLE001
-                    results.put((None, 0, str(e)))
+                    results.put((None, 0, mask_secrets(str(e), [key])[:300]))
 
             def finish():
                 if not button.winfo_exists():
@@ -1039,6 +1238,7 @@ def cmd_gui():
 
         def open_add(self):
             self.editing_index = None
+            self._editing_source = None
             self._clear_form()
             self._form_visible = True
             self.refresh()
@@ -1047,14 +1247,16 @@ def cmd_gui():
 
         def close_form(self):
             self.editing_index = None
+            self._editing_source = None
             self._form_visible = False
             self.refresh()
 
         def _edit(self, i):
             cfg = self._cfg()
-            if i >= len(cfg["sources"]):
+            if not self._card_is_current(cfg, i):
                 return
             s = cfg["sources"][i]
+            self._editing_source = copy.deepcopy(s)
             m = self.app.cfg_mod()
             self.vars["name"].set(s["name"])
             self.vars["base_url"].set(s["base_url"])
@@ -1074,10 +1276,11 @@ def cmd_gui():
             models = [x.strip() for x in re.split(r"[,，]", self.vars["model"].get())
                       if x.strip()]
             timeout = self.vars["timeout"].get().strip()
-            return m.normalize_source(
+            normalized = m.normalize_source(
                 self.vars["name"].get(), self.vars["base_url"].get(),
                 self.vars["api_key"].get(), models,
                 enabled=self.enabled.get(), timeout=int(timeout) if timeout else None)
+            return merge_source_edit(self._editing_source, normalized)
 
         def _save_form(self):
             try:
@@ -1086,7 +1289,9 @@ def cmd_gui():
                 messagebox.showerror("无法保存", str(e), parent=self)
                 return
             cfg = self._cfg()
-            if self.editing_index is None:
+            if cfg is None:
+                return
+            if self._editing_source is None:
                 if self.app.cfg_mod().find_source(cfg, src["name"]):
                     messagebox.showerror("无法添加", "已存在同名源「%s」" % src["name"],
                                          parent=self)
@@ -1095,6 +1300,12 @@ def cmd_gui():
                 msg = "已添加「%s」并保存（优先级第 %d）" % (src["name"],
                                                           len(cfg["sources"]))
             else:
+                index = next((i for i, s in enumerate(cfg["sources"])
+                              if s["name"] == self._editing_source["name"]), None)
+                if index is None or cfg["sources"][index] != self._editing_source:
+                    messagebox.showerror("无法保存", "正在编辑的中转源已被修改或删除，请取消并重新打开；本次未写入配置。", parent=self)
+                    return
+                self.editing_index = index
                 for k, s in enumerate(cfg["sources"]):
                     if k != self.editing_index and s["name"] == src["name"]:
                         messagebox.showerror("无法保存", "已存在同名源「%s」" % src["name"],
@@ -1105,8 +1316,10 @@ def cmd_gui():
                 if cfg.get("prefer") == old_name:
                     cfg["prefer"] = src["name"]  # 首选跟随改名
                 msg = "已更新「%s」并保存" % src["name"]
-            self._save(cfg)
+            if not self._save(cfg):
+                return
             self.editing_index = None
+            self._editing_source = None
             self._form_visible = False
             self.refresh()
             self.app.set_status(msg)
@@ -1114,11 +1327,12 @@ def cmd_gui():
 
         def _toggle_enabled_at(self, i):
             cfg = self._cfg()
-            if i >= len(cfg["sources"]):
+            if not self._card_is_current(cfg, i):
                 return
             s = cfg["sources"][i]
             s["enabled"] = not s.get("enabled", True)
-            self._save(cfg)
+            if not self._save(cfg):
+                return
             self.refresh()
             self.app.set_status("「%s」已%s" % (s["name"],
                                                "参与生图" if s["enabled"] else "禁用（不再尝试）"))
@@ -1126,7 +1340,7 @@ def cmd_gui():
 
         def _remove(self, i):
             cfg = self._cfg()
-            if i >= len(cfg["sources"]):
+            if not self._card_is_current(cfg, i):
                 return
             name = cfg["sources"][i]["name"]
             if not messagebox.askyesno("确认删除", "删除源「%s」？" % name, parent=self):
@@ -1134,9 +1348,11 @@ def cmd_gui():
             del cfg["sources"][i]
             if cfg.get("prefer") == name:
                 cfg.pop("prefer", None)  # 首选源被删：回退首个启用源
-            self._save(cfg)
-            if self.editing_index == i:
+            if not self._save(cfg):
+                return
+            if self._editing_source is not None and self._editing_source["name"] == name:
                 self.editing_index = None
+                self._editing_source = None
                 self._form_visible = False
             self.refresh()
             self.app.set_status("已删除「%s」" % name)
@@ -1144,6 +1360,8 @@ def cmd_gui():
 
         def _move(self, i, delta):
             cfg = self._cfg()
+            if not self._card_is_current(cfg, i):
+                return
             j = i + delta
             if not (0 <= j < len(cfg["sources"])):
                 return
@@ -1152,7 +1370,8 @@ def cmd_gui():
                 self.editing_index = j
             elif self.editing_index == j:
                 self.editing_index = i
-            self._save(cfg)
+            if not self._save(cfg):
+                return
             self.refresh()
             self.app.set_status("已调整后备顺序：「%s」→ 第 %d 位"
                                 % (cfg["sources"][j]["name"], j + 1))
@@ -1162,22 +1381,24 @@ def cmd_gui():
             """把第 i 个源设为★首选（记名到 cfg["prefer"]，不改动卡片顺序；
             禁用源会同时恢复参与生图——首选必须参与）。"""
             cfg = self._cfg()
-            if i >= len(cfg["sources"]):
+            if not self._card_is_current(cfg, i):
                 return
             src = cfg["sources"][i]
             if not src.get("enabled", True):
                 src["enabled"] = True
             cfg["prefer"] = src["name"]
-            self._save(cfg)
+            if not self._save(cfg):
+                return
             self.refresh()
             self.app.set_status("「%s」已设为★首选（生图先试它，卡片顺序不变）"
                                 % src["name"])
             self.app.refresh_state()
 
     # ---- 主窗口：ccswitch 式左侧导航栏 + 页面容器 ----
-    NAV = [("dashboard", "⏻", "Agent 接入"), ("sources", "⚙", "中转源")]
+    NAV = [("dashboard", "⏻", "Agent 接入"), ("sources", "⚙", "中转源"),
+           ("history", "◷", "任务历史")]
 
-    class App(tk.Tk):
+    class App(ManagedTk):
         def __init__(self):
             super().__init__()
             self.title("IMG Switch")
@@ -1189,7 +1410,12 @@ def cmd_gui():
             self.geometry("+%d+%d" % (max(0, (sw - 940) // 2),
                                       max(0, (sh - 680) // 2 - 20)))
             self._cfg_mod_cache = None
+            self._task_store_cache = None
             self._current_page = None
+            self.tasks = TaskController(self, self_exe_cmd() + ["__tool"], engine_env(),
+                self.task_store, os.environ.get("FAILOVER_IMAGEGEN_JOBS_DIR") or
+                os.path.join(os.path.dirname(appdata_config()), "jobs"))
+            self.protocol("WM_DELETE_WINDOW", self.close_app)
             self._build()
             upgrade_failures = sync_connected_skills()
             self.refresh_state()
@@ -1249,8 +1475,7 @@ def cmd_gui():
             self.status = tk.StringVar(value="就绪")
             tk.Label(bar, textvariable=self.status, bg=C["card"], fg=C["text"],
                      font=FONT_SM).pack(side="left")
-            tk.Label(bar, text="统一配置：" + appdata_config(), bg=C["card"],
-                     fg=C["light"], font=FONT_SM).pack(side="right", padx=16)
+            flat_btn(bar, "关于 / " + VERSION, self.about, fg=C["muted"]).pack(side="right", padx=12)
 
             side = tk.Frame(self, bg=C["side"], width=190, highlightthickness=1,
                             highlightbackground=C["line"])
@@ -1288,6 +1513,9 @@ def cmd_gui():
             self.side_state = tk.Label(bottom, text="", bg=C["side"], fg=C["muted"],
                                        font=FONT_SM, anchor="w", padx=22)
             self.side_state.pack(anchor="w")
+            tk.Label(bottom, text="v" + VERSION, bg=C["side"], fg=C["light"],
+                     font=FONT_SM, anchor="w", padx=22).pack(anchor="w", pady=(8, 2))
+            flat_btn(bottom, "关于与更新", self.about, padx=22).pack(anchor="w")
 
             self.container = tk.Frame(self, bg=C["bg"])
             self.container.pack(side="left", fill="both", expand=True)
@@ -1296,6 +1524,7 @@ def cmd_gui():
             self.pages = {
                 "dashboard": DashboardPage(self.container, self),
                 "sources": SourcesPage(self.container, self),
+                "history": TaskHistoryPage(self.container, self),
             }
             for page in self.pages.values():
                 page.grid(row=0, column=0, sticky="nsew")
@@ -1311,6 +1540,40 @@ def cmd_gui():
                 self._cfg_mod_cache = load_engine_module(
                     "failovercfg.py", "_fig_app_failovercfg")
             return self._cfg_mod_cache
+
+        def task_store(self):
+            if self._task_store_cache is None:
+                script_dir = os.path.dirname(engine_script("task_store.py"))
+                if script_dir not in sys.path:
+                    sys.path.insert(0, script_dir)
+                self._task_store_cache = load_engine_module("task_store.py", "_fig_app_task_store")
+            return self._task_store_cache
+
+        def safe_text(self, text, limit=1000):
+            keys = [source.get("api_key", "") for source in self.read_sources()]
+            return self.cfg_mod().mask_secrets(str(text), keys)[:limit]
+
+        def open_test_image(self, source_name=None):
+            return TestImageDialog(self, source_name)
+
+        def about(self):
+            dialog = DetailDialog(self, "关于 IMG Switch", "IMG Switch\n版本：" + VERSION +
+                "\n\n将图片生成请求发送给你配置的中转源，并保存任务历史与结果。" +
+                "\n\n统一配置：" + appdata_config() + "\n任务历史：" + self.tasks.jobs_dir +
+                "\n\n查看更新会在浏览器打开项目发布页；不会自动安装。")
+            import webbrowser
+            ttk.Button(dialog, text="查看发布与更新", command=lambda: webbrowser.open(
+                "https://github.com/Chris-haha/img-switch/releases")).pack(anchor="w", padx=16, pady=(0, 12))
+            return dialog
+
+        def close_app(self):
+            if self.tasks.active_ids():
+                self.set_status("正在取消任务；在途请求将保留为待核实状态", "off")
+                self.update_idletasks()
+            self.destroy()
+
+        def _before_tk_destroy(self):
+            self.tasks.close()
 
         def read_sources(self):
             try:
@@ -1328,6 +1591,7 @@ def cmd_gui():
             if self._current_page is self.pages.get("sources") and key != "sources":
                 sp = self.pages["sources"]
                 sp.editing_index = None
+                sp._editing_source = None
                 sp._form_visible = False
             self.pages[key].tkraise()
             self._current_page = self.pages[key]
@@ -1336,7 +1600,7 @@ def cmd_gui():
                     b.config(bg=C["select"], fg=C["text"])
                 else:
                     b.config(bg=C["side"], fg=C["muted"])
-            if key in ("dashboard", "sources"):
+            if key in ("dashboard", "sources", "history"):
                 self.pages[key].refresh()
 
         def refresh_state(self):
@@ -1352,11 +1616,14 @@ def cmd_gui():
         def set_failover(self, on):
             try:
                 cfg = self.cfg_mod().load_config(appdata_config()) \
-                    or {"version": 1, "sources": []}
-            except RuntimeError:
-                cfg = {"version": 1, "sources": []}
-            cfg["failover"] = bool(on)
-            self.cfg_mod().save_config(cfg, appdata_config())
+                    or self.cfg_mod().default_config()
+                cfg["failover"] = bool(on)
+                self.cfg_mod().save_config(cfg, appdata_config())
+            except (RuntimeError, OSError) as e:
+                self.pages["sources"].update_failover_ui()
+                self.set_status("无法修改故障转移，原配置已保留", "off")
+                messagebox.showerror("无法保存", str(e), parent=self)
+                return
             self.pages["sources"].update_failover_ui()
             if on:
                 self.set_status("故障转移已开启：失败自动切换下一个源/模型")
@@ -1367,7 +1634,6 @@ def cmd_gui():
         def toggle_host(self, host, want_on):
             label = dict(AGENT_HOSTS).get(host, host)
             try:
-                set_host_enabled(host, want_on)
                 if want_on:
                     installed = install_skill([host])
                     self.set_status("已接入 %s（%d 处安装）" % (label, len(installed)))
@@ -1375,6 +1641,7 @@ def cmd_gui():
                     removed = remove_skill([host])
                     self.set_status("已断开 %s（%d 处移除，配置保留）"
                                     % (label, len(removed)))
+                set_host_enabled(host, want_on)
             except Exception as e:  # noqa: BLE001
                 messagebox.showerror("操作失败", str(e))
             self.refresh_state()  # 失败时把开关拨回真实状态
@@ -1399,6 +1666,8 @@ def cmd_gui():
             self.refresh_state()
 
     app = App()
+    if not run_loop:
+        return app
     if os.environ.get("FAILOVER_IMAGEGEN_APP_SMOKE"):
         app.update()
         app.update_idletasks()
@@ -1409,7 +1678,7 @@ def cmd_gui():
         # 自测：真实构建界面后断言页面/开关/卡片/新增流程（供 app_tests.py 验证）
         app.update()
         app.update_idletasks()
-        assert set(app.pages) == {"dashboard", "sources"}, \
+        assert set(app.pages) == {"dashboard", "sources", "history"}, \
             "页面缺失：%s" % list(app.pages)
         dp = app.pages["dashboard"]
         for key in ("dashboard", "sources", "dashboard"):
@@ -1531,7 +1800,7 @@ def cmd_gui():
             server.shutdown()
             server.server_close()
         app.destroy()
-        print("app selftest ok（2 页面/Agent 卡 %d 张/源页故障转移/源卡 %d 张/设为首选/内嵌新增）"
+        print("app selftest ok（3 页面/Agent 卡 %d 张/源页故障转移/源卡 %d 张/设为首选/内嵌新增）"
               % (active_n, len(after)))
         return 0
     app.mainloop()
@@ -1571,7 +1840,12 @@ def _child_tool():
         out_file = open(out_path, "w", encoding="utf-8", errors="replace")
         sys.stdout = _Tee(sys.stdout, out_file)
     try:
-        mod = load_engine_module("failover_imagegen_tool.py", "_fig_engine_tool")
+        # Spawn workers must be able to import their owning module by this name.
+        # Dynamic aliases such as _fig_engine_tool cannot be re-imported in a child.
+        script_dir = os.path.dirname(engine_script("failover_imagegen_tool.py"))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        import failover_imagegen_tool as mod
         return mod.main(sys.argv[2:])
     finally:
         if out_file:
@@ -1613,4 +1887,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Frozen multiprocessing children must dispatch before opening any GUI.
+    import multiprocessing
+    _engine_scripts = os.path.dirname(engine_script("failover_imagegen_tool.py"))
+    if _engine_scripts not in sys.path:
+        sys.path.insert(0, _engine_scripts)
+    multiprocessing.freeze_support()
     sys.exit(main())

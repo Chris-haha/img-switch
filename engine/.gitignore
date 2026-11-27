@@ -1,5 +1,7 @@
 # 本地配置含 API Key，禁止提交
 config.json
+config.json.backup
+config.json.lock
 config.json.tmp
 
 # 生成产物

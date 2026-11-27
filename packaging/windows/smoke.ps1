@@ -1,25 +1,55 @@
-param([Parameter(Mandatory=$true)][string]$Installer)
+param(
+    [Parameter(Mandatory=$true)][string]$Installer,
+    [string]$EvidenceDirectory
+)
 $ErrorActionPreference = 'Stop'
 $installerPath = (Resolve-Path -LiteralPath $Installer).Path
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('img-switch-smoke-' + [guid]::NewGuid().ToString('N'))
 $appDir = Join-Path $testRoot 'Installed App'
 $homeDir = Join-Path $testRoot 'Test Home'
 $appDataDir = Join-Path $testRoot 'AppData'
-$pythonPath = (Get-Command python -ErrorAction Stop).Source
+$pythonPath = if ($env:PYTHON) { (Resolve-Path -LiteralPath $env:PYTHON -ErrorAction Stop).Path } else { (Get-Command python -ErrorAction Stop).Source }
+if (!$EvidenceDirectory) {
+    $EvidenceDirectory = Join-Path (Split-Path -Parent $installerPath) ('windows-acceptance-' + [guid]::NewGuid().ToString('N'))
+}
+$evidence = [IO.Path]::GetFullPath($EvidenceDirectory)
+if ((Test-Path -LiteralPath $evidence) -and @(Get-ChildItem -LiteralPath $evidence -Force).Count -gt 0) {
+    throw 'Evidence directory must be empty so a prior report cannot masquerade as this run.'
+}
 $mockProcess = $null
 $previous = @{}
-function Invoke-CheckedProcess([string]$FilePath, [string[]]$Arguments) {
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru
+function Invoke-CheckedProcess([string]$FilePath, [string[]]$Arguments, [string]$LogPrefix = '') {
+    $options = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
+    if ($LogPrefix) {
+        $options.RedirectStandardOutput = $LogPrefix + '-stdout.txt'
+        $options.RedirectStandardError = $LogPrefix + '-stderr.txt'
+    }
+    $process = Start-Process @options
+    # Windows PowerShell 5.1 must retain the handle before waiting when streams
+    # are redirected, otherwise ExitCode can be null after a successful exit.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     if (!$process.WaitForExit(120000)) {
-        $process.Kill()
+        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $process.Id /T /F | Out-Null
         throw "Process timed out: $FilePath"
     }
-    if ($process.ExitCode -ne 0) { throw "Process failed with exit code $($process.ExitCode): $FilePath" }
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $process.Dispose()
+    if ($LogPrefix) {
+        foreach ($path in @($options.RedirectStandardOutput, $options.RedirectStandardError)) {
+            if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Encoding UTF8 | Write-Output }
+        }
+    }
+    if ($null -eq $exitCode) { throw "Process exit code unavailable: $FilePath" }
+    if ($exitCode -ne 0) { throw "Process failed with exit code ${exitCode}: $FilePath" }
 }
-foreach ($name in @('APPDATA','FAILOVER_IMAGEGEN_APP_HOME','FAILOVER_IMAGEGEN_TOOL_CONFIG','FAILOVER_IMAGEGEN_APP_SMOKE','FAILOVER_IMAGEGEN_CHILD_OUT','PYTHONHOME','PYTHONPATH','PATH')) {
+foreach ($name in @('APPDATA','FAILOVER_IMAGEGEN_APP_HOME','FAILOVER_IMAGEGEN_TOOL_CONFIG',
+        'FAILOVER_IMAGEGEN_JOBS_DIR','FAILOVER_IMAGEGEN_APP_SMOKE','FAILOVER_IMAGEGEN_APP_SELFTEST',
+        'FAILOVER_IMAGEGEN_CHILD_OUT','PYTHONHOME','PYTHONPATH','PYTHONDONTWRITEBYTECODE','PATH')) {
     $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
-New-Item -ItemType Directory -Force -Path $testRoot, $homeDir, $appDataDir | Out-Null
+New-Item -ItemType Directory -Force -Path $testRoot, $homeDir, $appDataDir, $evidence | Out-Null
 try {
     foreach ($hive in @('HKCU:', 'HKLM:')) {
         if (Test-Path "$hive\Software\Microsoft\Windows\CurrentVersion\Uninstall\{AD6F616E-EE64-467A-8DD7-935BCB23A218}_is1") {
@@ -28,9 +58,14 @@ try {
     }
     $env:APPDATA = $appDataDir
     $env:FAILOVER_IMAGEGEN_APP_HOME = $homeDir
+    $env:FAILOVER_IMAGEGEN_TOOL_CONFIG = Join-Path $appDataDir 'failover-imagegen-tool\config.json'
+    $env:FAILOVER_IMAGEGEN_JOBS_DIR = Join-Path $appDataDir 'failover-imagegen-tool\jobs'
+    $env:PYTHONDONTWRITEBYTECODE = '1'
+    Remove-Item Env:FAILOVER_IMAGEGEN_APP_SMOKE, Env:FAILOVER_IMAGEGEN_APP_SELFTEST, Env:FAILOVER_IMAGEGEN_CHILD_OUT -ErrorAction SilentlyContinue
     $portFile = Join-Path $testRoot 'mock-port.txt'
     $mockScript = Join-Path $PSScriptRoot 'mock_server.py'
-    $mockProcess = Start-Process -FilePath $pythonPath -ArgumentList @('-B', ('"' + $mockScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden
+    $mockProcess = Start-Process -FilePath $pythonPath -ArgumentList @('-B', ('"' + $mockScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $evidence 'mock-server-stdout.txt') -RedirectStandardError (Join-Path $evidence 'mock-server-stderr.txt')
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
     while (!(Test-Path -LiteralPath $portFile) -and [DateTime]::UtcNow -lt $deadline) {
         if ($mockProcess.HasExited) { throw 'Local mock server exited before becoming ready' }
@@ -38,47 +73,30 @@ try {
     }
     if (!(Test-Path -LiteralPath $portFile)) { throw 'Local mock server startup timed out' }
     $port = (Get-Content -LiteralPath $portFile -Raw).Trim()
-    if ($port -notmatch '^\d+$') { throw 'Local mock server returned invalid port' }
-    $env:PATH = Join-Path $env:SystemRoot 'System32'
+    if ($port -notmatch '^\d+$' -or [int]$port -lt 1 -or [int]$port -gt 65535) { throw 'Local mock server returned invalid port' }
+    # JPEG uses the built-in PowerShell/GDI+ decoder. Neither system directory
+    # contains Python; the controller keeps its previously resolved absolute path.
+    $env:PATH = (Join-Path $env:SystemRoot 'System32') + ';' + (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0')
     Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
-    $env:FAILOVER_IMAGEGEN_TOOL_CONFIG = Join-Path $testRoot 'config.json'
-    $config = @{ version = 1; sources = @(@{ name = 'test-source'; base_url = "http://127.0.0.1:$port/v1"; api_key = 'test-key'; model = 'mock-image-1'; enabled = $true }) } | ConvertTo-Json -Compress -Depth 4
-    [IO.File]::WriteAllText($env:FAILOVER_IMAGEGEN_TOOL_CONFIG, $config, [Text.UTF8Encoding]::new($false))
-    Invoke-CheckedProcess $installerPath @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR="' + $appDir + '"'))
+    Invoke-CheckedProcess $installerPath @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
+        ('/DIR="' + $appDir + '"'), ('/LOG="' + (Join-Path $evidence 'install.log') + '"'))
     $app = Join-Path $appDir 'IMG-Switch.exe'
     if (!(Test-Path -LiteralPath $app)) { throw 'Installed app missing' }
-    $env:FAILOVER_IMAGEGEN_APP_SMOKE = '1'
-    Invoke-CheckedProcess $app @('gui')
-    Remove-Item Env:FAILOVER_IMAGEGEN_APP_SMOKE
-    $env:FAILOVER_IMAGEGEN_CHILD_OUT = Join-Path $testRoot 'gui-child-output.txt'
-    Invoke-CheckedProcess $app @('__tool', '--list-sources')
-    if (!(Test-Path -LiteralPath $env:FAILOVER_IMAGEGEN_CHILD_OUT) -or
-        (Get-Content -LiteralPath $env:FAILOVER_IMAGEGEN_CHILD_OUT -Raw) -notmatch 'test-source') {
-        throw 'Bundled GUI engine invocation did not return expected output'
-    }
-    Remove-Item Env:FAILOVER_IMAGEGEN_CHILD_OUT
-    Invoke-CheckedProcess $app @('on')
-    $skill = Join-Path $homeDir '.agents\skills\failover-imagegen-tool'
-    $engine = Join-Path $skill 'bin\img-switch-engine.exe'
-    if (!(Test-Path -LiteralPath $engine)) { throw 'Standalone engine was not installed' }
-    $output = & $engine --list-sources 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -or $output -notmatch 'test-source') { throw "Standalone engine failed, exit $LASTEXITCODE; output: $output" }
-    $outDir = Join-Path $testRoot 'generated'
-    $output = & $engine generate --prompt 'test' --size 64x64 --name smoke --outdir $outDir 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "Standalone generation failed, exit $LASTEXITCODE; output: $output" }
-    $png = @(Get-ChildItem -LiteralPath $outDir -Filter '*.png')
-    $meta = @(Get-ChildItem -LiteralPath $outDir -Filter '*.meta.json')
-    if ($png.Count -ne 1 -or $meta.Count -ne 1) { throw 'Standalone generation did not produce one PNG and one metadata file' }
-    $signature = [IO.File]::ReadAllBytes($png[0].FullName)
-    if ($signature.Length -lt 8 -or [BitConverter]::ToString($signature[0..7]) -ne '89-50-4E-47-0D-0A-1A-0A') { throw 'Generated file is not a PNG' }
-    $metadata = Get-Content -LiteralPath $meta[0].FullName -Raw | ConvertFrom-Json
-    if ($metadata.source.name -ne 'test-source') { throw 'Metadata does not identify the test source' }
-    Invoke-CheckedProcess $app @('off')
-    if (Test-Path -LiteralPath $skill) { throw 'Agent removal failed' }
+    $native = Join-Path $PSScriptRoot 'native_smoke.py'
+    & $pythonPath -B $native --phase exercise --app $app --work $testRoot --evidence $evidence --port $port
+    if ($LASTEXITCODE -ne 0) { throw 'Installed Windows GUI/engine acceptance failed; see windows-native-smoke.json' }
+    # Additional source-level native tests force the fallback termination branch
+    # with real child and grandchild processes; these are distinct from package acceptance.
+    # unittest writes progress to stderr even when successful. Windows PowerShell
+    # 5.1 treats redirected native stderr as errors under ErrorActionPreference=Stop.
+    # Capture both streams as files, print their text, then inspect the exit code.
+    Invoke-CheckedProcess $pythonPath @('-B', ('"' + (Join-Path $PSScriptRoot 'test_native_processes.py') + '"'), '-v') (Join-Path $evidence 'native-process-tests')
     $uninstaller = Join-Path $appDir 'unins000.exe'
-    Invoke-CheckedProcess $uninstaller @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART')
-    if (!(Test-Path -LiteralPath $env:FAILOVER_IMAGEGEN_TOOL_CONFIG)) { throw 'Uninstall deleted user config' }
-    Write-Output 'Windows installed GUI and standalone engine smoke passed'
+    Invoke-CheckedProcess $uninstaller @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
+        ('/LOG="' + (Join-Path $evidence 'uninstall.log') + '"'))
+    & $pythonPath -B $native --phase verify-uninstall --app $app --work $testRoot --evidence $evidence
+    if ($LASTEXITCODE -ne 0) { throw 'Uninstall byte-preservation acceptance failed' }
+    Write-Output 'Windows installed GUI/engine acceptance and native process-tree tests passed (loopback image provider).'
 } finally {
     if ($null -ne $mockProcess -and !$mockProcess.HasExited) { Stop-Process -Id $mockProcess.Id -Force -ErrorAction SilentlyContinue }
     $uninstaller = Join-Path $appDir 'unins000.exe'
@@ -86,5 +104,8 @@ try {
         try { Invoke-CheckedProcess $uninstaller @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') } catch { Write-Warning "Uninstaller cleanup failed: $_" }
     }
     foreach ($name in $previous.Keys) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+    $report = Join-Path $evidence 'windows-native-smoke.json'
+    if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Raw | Write-Output }
+    Write-Output "Windows acceptance evidence: $evidence"
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

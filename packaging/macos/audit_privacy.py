@@ -5,6 +5,7 @@ Run with the same Python environment used to build the app (PyInstaller is requi
 Nonzero means a path/hostname was found or the scan was incomplete.
 """
 import collections
+import importlib.util
 import io
 import marshal
 import os
@@ -15,6 +16,9 @@ import sys
 import types
 import zipfile
 import tempfile
+import runpy
+
+is_zip_payload = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'runtime/nozip.py'))['is_zip_payload']
 
 USER_PATH = re.compile(rb'(?i)(?:/users/[^/\s\x00]+|/home/[^/\s\x00]+|[a-z]:\\users\\[^\\\s\x00]+)')
 BUILD_PATH = re.compile(rb'(?i)(?:/private)?/tmp/img-switch-build\.[a-z0-9]+')
@@ -108,6 +112,11 @@ class Scanner:
                 if name.endswith('.pyc'):
                     self.code(marshal.loads(payload[16:]), entry)
 
+    def pyc(self, data, location):
+        if len(data) < 16 or data[:4] != importlib.util.MAGIC_NUMBER:
+            raise ValueError('invalid or mismatched pyc header')
+        self.code(marshal.loads(data[16:]), location)
+
     def pyinstaller(self, file, location):
         from PyInstaller.archive.readers import CArchiveReader
         archive = CArchiveReader(str(file))
@@ -121,7 +130,9 @@ class Scanner:
                     elif isinstance(payload, bytes):
                         self.bytes(payload, location + ' :: PYZ :: ' + item)
             elif name.endswith('.zip'):
-                self.zip(archive.extract(name), location + ' :: ' + name)
+                raise ValueError('ZIP payload is forbidden in noarchive builds')
+            elif name.endswith('.pyc'):
+                self.pyc(archive.extract(name), location + ' :: ' + name)
             elif name in ('app', 'failover_imagegen_tool', 'pyiboot01_bootstrap', 'pyi_rth_inspect', 'pyi_rth__tkinter'):
                 self.code(marshal.loads(archive.extract(name)), location + ' :: ' + name)
             else:
@@ -137,8 +148,10 @@ class Scanner:
                 data = file.read_bytes()
                 location = file.relative_to(contents).as_posix()
                 self.bytes(data, location)
-                if file.name == 'base_library.zip':
-                    self.zip(data, location)
+                if file.suffix.lower() == '.zip' or is_zip_payload(io.BytesIO(data)):
+                    raise ValueError('ZIP file is forbidden in noarchive builds')
+                if file.suffix.lower() == '.pyc':
+                    self.pyc(data, location)
         self.pyinstaller(contents / 'MacOS/IMG Switch', 'MacOS/IMG Switch')
         self.pyinstaller(contents / 'Frameworks/engine/bin/img-switch-engine', 'Frameworks/engine/bin/img-switch-engine')
 
