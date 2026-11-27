@@ -3,6 +3,9 @@ import tempfile
 import unittest
 import subprocess
 import json
+import os
+import runpy
+import shutil
 import sys
 import time
 import urllib.request
@@ -11,6 +14,53 @@ from pathlib import Path
 PATH = Path(__file__).with_name('build_windows.py')
 
 class BuildTest(unittest.TestCase):
+    def test_prerelease_name_is_separate_from_numeric_windows_versions(self):
+        version = runpy.run_path(str(PATH.parents[2] / 'version.py'))
+        setup = PATH.with_name('setup.iss').read_text(encoding='utf-8')
+        for macro, key in (('AppVersion', 'VERSION'), ('NumericVersion', 'NUMERIC_VERSION'), ('BuildNumber', 'BUILD_NUMBER')):
+            setup = setup.replace('{#' + macro + '}', version[key])
+        values = dict(line.split('=', 1) for line in setup.splitlines() if '=' in line)
+        expected = version['NUMERIC_VERSION'] + '.' + version['BUILD_NUMBER']
+        for field in ('VersionInfoVersion', 'VersionInfoProductVersion'):
+            self.assertRegex(values[field], r'^[0-9]+(?:\.[0-9]+){3}$', field + ' must be a numeric Windows version')
+            self.assertEqual(values[field], expected)
+        for field in ('AppVersion', 'VersionInfoTextVersion', 'VersionInfoProductTextVersion'):
+            self.assertEqual(values[field], version['VERSION'])
+
+    @unittest.skipUnless(os.name == 'nt', 'requires actual Windows Inno Setup compiler')
+    def test_inno_compiles_prerelease_with_numeric_and_text_version_resources(self):
+        root = PATH.parents[2]
+        version = runpy.run_path(str(root / 'version.py'))
+        iscc = shutil.which('iscc') or shutil.which('ISCC.exe')
+        self.assertIsNotNone(iscc, 'native packaging checks require preinstalled Inno Setup')
+        with tempfile.TemporaryDirectory(prefix='img-switch-inno-') as directory:
+            work = Path(directory)
+            # A valid small EXE is enough to compile all installer directives.
+            # This fixture installer is never installed or executed.
+            executable = work / 'IMG-Switch.exe'
+            shutil.copyfile(sys.executable, executable)
+            command = [iscc, '/DAppVersion=' + version['VERSION'],
+                '/DNumericVersion=' + version['NUMERIC_VERSION'], '/DBuildNumber=' + version['BUILD_NUMBER'],
+                '/DAppExe=' + str(executable), '/DProjectLicense=' + str(root / 'LICENSE'),
+                '/DPythonLicense=' + str(Path(sys.base_prefix) / 'LICENSE.txt'),
+                '/DThirdPartyLicenses=' + str(PATH.parent / 'licenses'),
+                '/DRuntimeNotice=' + str(root / 'packaging/runtime/NOTICE.txt'),
+                '/DSetupIcon=' + str(root / 'assets/img-switch.ico'), '/O' + str(work), str(PATH.with_name('setup.iss'))]
+            result = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=90)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            installer = work / ('IMG-Switch-' + version['VERSION'] + '-Windows-x64-unsigned-setup.exe')
+            self.assertTrue(installer.is_file())
+            quoted = str(installer).replace("'", "''")
+            script = "(Get-Item -LiteralPath '%s').VersionInfo | Select-Object ProductVersion,FileVersion,FileMajorPart,FileMinorPart,FileBuildPart,FilePrivatePart,ProductMajorPart,ProductMinorPart,ProductBuildPart,ProductPrivatePart | ConvertTo-Json -Compress" % quoted
+            inspected = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
+                capture_output=True, text=True, errors='replace', timeout=15)
+            self.assertEqual(inspected.returncode, 0, inspected.stdout + inspected.stderr)
+            metadata = json.loads(inspected.stdout)
+            expected = [int(part) for part in (version['NUMERIC_VERSION'] + '.' + version['BUILD_NUMBER']).split('.')]
+            for prefix in ('File', 'Product'):
+                self.assertEqual([metadata[prefix + part + 'Part'] for part in ('Major', 'Minor', 'Build', 'Private')], expected)
+                self.assertEqual(metadata[prefix + 'Version'], version['VERSION'])
+
     def test_local_mock_server_returns_image(self):
         script = PATH.with_name('mock_server.py')
         self.assertTrue(script.is_file(), 'local mock server missing')
