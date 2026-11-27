@@ -12,11 +12,12 @@ permissions:
 
 concurrency:
   group: native-installers-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PYTHONDONTWRITEBYTECODE: '1'
   PYTHONUTF8: '1'
+  PYTHONUNBUFFERED: '1'
 
 jobs:
   source:

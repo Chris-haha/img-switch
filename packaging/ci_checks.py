@@ -30,10 +30,13 @@ def check_platform(target):
             raise RuntimeError('Rosetta is not a native Intel acceptance environment')
 
 
-def execute(command, label):
+def execute(command, label, timeout=180):
     print('\nCHECK ' + label, flush=True)
     started = time.monotonic()
-    result = subprocess.run(command, cwd=ROOT)
+    try:
+        result = subprocess.run(command, cwd=ROOT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Check timed out after %s seconds: %s' % (timeout, label)) from None
     entry = {'name': label, 'passed': result.returncode == 0,
              'elapsed_seconds': round(time.monotonic() - started, 2)}
     if result.returncode:
@@ -46,7 +49,15 @@ def run_tests(target, record):
     names = list(COMMON)
     folder = 'windows' if target == 'windows-x64' else 'macos'
     names += [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / 'packaging' / folder).glob('test_*.py'))]
-    record['checks'] = [execute([sys.executable, '-B', name], name) for name in names]
+    # Print the exact test in progress and thread stacks before a stuck script
+    # reaches its deadline. This also covers native Tk calls that never return.
+    bootstrap = ('import faulthandler, os, runpy, sys; '
+                 'faulthandler.enable(); faulthandler.dump_traceback_later(90, repeat=True); '
+                 'sys.argv = sys.argv[1:]; '
+                 'sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0]))); '
+                 'runpy.run_path(sys.argv[0], run_name="__main__")')
+    record['checks'] = [execute([sys.executable, '-B', '-u', '-c', bootstrap, name, '-v'], name)
+                        for name in names]
     record['tests_passed'] = True
 
 
@@ -59,7 +70,7 @@ def smoke(target, package, record):
                    str(ROOT / 'packaging/windows/smoke.ps1'), '-Installer', str(package)]
     else:
         command = [sys.executable, '-B', str(ROOT / 'packaging/macos/smoke.py'), str(package)]
-    record['checks'].append(execute(command, 'installed_smoke'))
+    record['checks'].append(execute(command, 'installed_smoke', timeout=600))
     record['installed_smoke_passed'] = True
 
 

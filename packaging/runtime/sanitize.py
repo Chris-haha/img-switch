@@ -16,6 +16,9 @@ import zipfile
 import hashlib
 import shutil
 import subprocess
+import runpy
+
+is_zip_payload = runpy.run_path(str(Path(__file__).with_name('nozip.py')))['is_zip_payload']
 
 EXAMPLE_LINE = re.compile(
     rb"(?m)^[ \t]*splitroot\('C:/Users/([A-Za-z0-9_-]+)'\) == "
@@ -146,8 +149,12 @@ def scrub_datas(datas, directory):
     directory.mkdir(parents=True, exist_ok=True)
     result = []
     for name, source, kind in datas:
-        if Path(name).suffix.lower() == '.zip' or zipfile.is_zipfile(source):
-            raise ValueError('ZIP runtime data is forbidden; rebuild with --debug noarchive')
+        if Path(name).suffix.lower() == '.zip' or is_zip_payload(source):
+            # The destination is package-relative; never print the build host's
+            # absolute source path when reporting a rejected dependency.
+            raise ValueError('ZIP runtime data is forbidden: %s; rebuild with --debug noarchive' % Path(name).name)
+        if zipfile.is_zipfile(source):
+            print('Validated non-ZIP runtime data after signature-only match:', Path(name).name)
         if Path(name).suffix.lower() == '.pyc':
             data, count = remove_example(Path(source).read_bytes())
             if Path(name).name.startswith('_sysconfigdata_'):

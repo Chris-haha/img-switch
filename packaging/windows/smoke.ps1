@@ -18,13 +18,23 @@ if ((Test-Path -LiteralPath $evidence) -and @(Get-ChildItem -LiteralPath $eviden
 }
 $mockProcess = $null
 $previous = @{}
-function Invoke-CheckedProcess([string]$FilePath, [string[]]$Arguments) {
-    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru
+function Invoke-CheckedProcess([string]$FilePath, [string[]]$Arguments, [string]$LogPrefix = '') {
+    $options = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
+    if ($LogPrefix) {
+        $options.RedirectStandardOutput = $LogPrefix + '-stdout.txt'
+        $options.RedirectStandardError = $LogPrefix + '-stderr.txt'
+    }
+    $process = Start-Process @options
     if (!$process.WaitForExit(120000)) {
         & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $process.Id /T /F | Out-Null
         throw "Process timed out: $FilePath"
     }
     $process.Refresh()
+    if ($LogPrefix) {
+        foreach ($path in @($options.RedirectStandardOutput, $options.RedirectStandardError)) {
+            if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Encoding UTF8 | Write-Output }
+        }
+    }
     if ($process.ExitCode -ne 0) { throw "Process failed with exit code $($process.ExitCode): $FilePath" }
 }
 foreach ($name in @('APPDATA','FAILOVER_IMAGEGEN_APP_HOME','FAILOVER_IMAGEGEN_TOOL_CONFIG',
@@ -69,8 +79,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Installed Windows GUI/engine acceptance failed; see windows-native-smoke.json' }
     # Additional source-level native tests force the fallback termination branch
     # with real child and grandchild processes; these are distinct from package acceptance.
-    & $pythonPath -B (Join-Path $PSScriptRoot 'test_native_processes.py') -v 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'native-process-tests.txt')
-    if ($LASTEXITCODE -ne 0) { throw 'Native Windows process-tree tests failed' }
+    # unittest writes progress to stderr even when successful. Windows PowerShell
+    # 5.1 treats redirected native stderr as errors under ErrorActionPreference=Stop.
+    # Capture both streams as files, print their text, then inspect the exit code.
+    Invoke-CheckedProcess $pythonPath @('-B', ('"' + (Join-Path $PSScriptRoot 'test_native_processes.py') + '"'), '-v') (Join-Path $evidence 'native-process-tests')
     $uninstaller = Join-Path $appDir 'unins000.exe'
     Invoke-CheckedProcess $uninstaller @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',
         ('/LOG="' + (Join-Path $evidence 'uninstall.log') + '"'))

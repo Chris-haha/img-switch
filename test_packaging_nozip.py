@@ -1,5 +1,6 @@
 """Release regressions that never create ZIPs or run a native build."""
 import importlib.util
+import io
 import marshal
 from pathlib import Path
 import struct
@@ -34,6 +35,56 @@ def carchive(audit, entries):
 
 
 class NoZipPackagingTests(unittest.TestCase):
+    def test_zip_signatures_in_python_bytecode_are_not_archives(self):
+        audit = module('packaging/runtime/nozip.py')
+        sanitize = module('packaging/runtime/sanitize.py')
+        payload = bytecode(source="signature = b'PK\\x05\\x06'\npadding = b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n")
+        # Python 3.12 and older accept this signature without validating its
+        # central directory. These are ordinary marshalled Python constants.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'constants.pyc'
+            source.write_bytes(payload)
+            self.assertEqual(audit.check_tree(source), 1)
+            result = sanitize.scrub_datas([('constants.pyc', str(source), 'DATA')], Path(directory) / 'copy')
+            self.assertEqual(result[0][1], str(source))
+            self.assertEqual(source.read_bytes(), payload)
+            mac = module('packaging/macos/audit_privacy.py')
+            app = Path(directory) / 'App.app'
+            resources = app / 'Contents/Resources'
+            resources.mkdir(parents=True)
+            (resources / 'constants.pyc').write_bytes(payload)
+            scanner = mac.Scanner()
+            with mock.patch.object(scanner, 'pyinstaller'):
+                scanner.app(app)
+            self.assertFalse(scanner.counts)
+
+    def test_embedded_archive_directory_is_checked_read_only(self):
+        audit = module('packaging/runtime/nozip.py')
+        stream = io.BytesIO(b'ordinary non-archive bytes for a mocked read-only reader')
+        with mock.patch.object(audit.zipfile, 'is_zipfile', return_value=True), \
+             mock.patch.object(audit.zipfile, 'ZipFile') as reader:
+            self.assertTrue(audit.is_zip_payload(stream))
+        reader.assert_called_once_with(stream, mode='r')
+        self.assertEqual(stream.tell(), 0)
+
+    def test_zip_headers_remain_forbidden_even_if_archive_is_truncated(self):
+        audit = module('packaging/runtime/nozip.py')
+        # A four-byte header is not an archive and cannot contain any entries.
+        # No ZIP fixture is created; this checks fail-closed header detection.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'truncated-header.bin'
+            source.write_bytes(b'PK\x03\x04')
+            with self.assertRaisesRegex(ValueError, 'ZIP'):
+                audit.check_tree(source)
+
+    def test_named_zip_data_still_fails_with_package_relative_diagnostic(self):
+        sanitize = module('packaging/runtime/sanitize.py')
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'plain-data'
+            source.write_bytes(b'not an archive fixture')
+            with self.assertRaisesRegex(ValueError, 'forbidden-data.zip'):
+                sanitize.scrub_datas([('forbidden-data.zip', str(source), 'DATA')], Path(directory) / 'copy')
+
     def test_default_source_delivery_is_complete_directory_without_zip_writer(self):
         build = module('packaging/source/build_source.py')
         required = {'gui_tasks.py', 'version.py', 'test_reliability.py', 'test_engine_jobs.py',

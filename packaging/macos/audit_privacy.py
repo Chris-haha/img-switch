@@ -16,6 +16,9 @@ import sys
 import types
 import zipfile
 import tempfile
+import runpy
+
+is_zip_payload = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'runtime/nozip.py'))['is_zip_payload']
 
 USER_PATH = re.compile(rb'(?i)(?:/users/[^/\s\x00]+|/home/[^/\s\x00]+|[a-z]:\\users\\[^\\\s\x00]+)')
 BUILD_PATH = re.compile(rb'(?i)(?:/private)?/tmp/img-switch-build\.[a-z0-9]+')
@@ -145,7 +148,7 @@ class Scanner:
                 data = file.read_bytes()
                 location = file.relative_to(contents).as_posix()
                 self.bytes(data, location)
-                if file.suffix.lower() == '.zip' or zipfile.is_zipfile(io.BytesIO(data)):
+                if file.suffix.lower() == '.zip' or is_zip_payload(io.BytesIO(data)):
                     raise ValueError('ZIP file is forbidden in noarchive builds')
                 if file.suffix.lower() == '.pyc':
                     self.pyc(data, location)

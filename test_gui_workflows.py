@@ -13,6 +13,7 @@ import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
+from types import SimpleNamespace
 
 import app
 from engine.tests.mock_relay import make_png
@@ -50,6 +51,35 @@ class GUIRelay(BaseHTTPRequestHandler):
 
 
 class WorkflowContractTests(unittest.TestCase):
+    def test_gui_fixture_isolates_windows_appdata_and_inherited_jobs(self):
+        with tempfile.TemporaryDirectory(prefix="gui-outside-fixture-") as directory:
+            outside = Path(directory)
+            inherited_config = outside / "appdata" / "failover-imagegen-tool" / "config.json"
+            inherited_config.parent.mkdir(parents=True)
+            original = json.dumps({"sources": [], "outside_fixture": True}).encode()
+            inherited_config.write_bytes(original)
+            windows_os = SimpleNamespace(**vars(os))
+            windows_os.name = "nt"
+            with mock.patch.dict(os.environ, {"APPDATA": str(outside / "appdata"),
+                                              "LOCALAPPDATA": str(outside / "local"),
+                                              "FAILOVER_IMAGEGEN_JOBS_DIR": str(outside / "jobs")}), \
+                    mock.patch.object(app, "os", windows_os):
+                for index in range(2):
+                    case = NativeWorkflowTests()
+                    try:
+                        case.setUp()
+                        root = Path(case.temp.name).resolve()
+                        self.assertTrue(Path(app.appdata_config()).resolve().is_relative_to(root),
+                                        "Windows AppData escaped the current test fixture")
+                        self.assertTrue(Path(case.gui.tasks.jobs_dir).resolve().is_relative_to(root),
+                                        "Inherited jobs directory escaped the current test fixture")
+                        self.assertEqual(case.gui.tasks.records(), [], "a previous fixture leaked task history")
+                        case.seed("succeeded", prompt="fixture %d" % index)
+                    finally:
+                        case.tearDown()
+            self.assertEqual(inherited_config.read_bytes(), original)
+            self.assertFalse((outside / "jobs").exists())
+
     def test_destroyed_gui_can_be_collected_by_worker_without_tcl_access(self):
         script = r'''
 import gc, threading, sys
@@ -171,20 +201,40 @@ print("external references and timers clean")
 class NativeWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="img-switch-gui-")
+        self.addCleanup(self.temp.cleanup)
+        workspace = Path(self.temp.name)
+        config_home = workspace / ".config"
+        self.gui = None
         self.env = mock.patch.dict(os.environ, {
             "FAILOVER_IMAGEGEN_APP_HOME": self.temp.name,
-            "XDG_CONFIG_HOME": str(Path(self.temp.name) / ".config"),
-            "FAILOVER_IMAGEGEN_TOOL_CONFIG": str(Path(self.temp.name) / ".config" / "failover-imagegen-tool" / "config.json"),
+            "HOME": self.temp.name,
+            "USERPROFILE": self.temp.name,
+            "APPDATA": str(config_home),
+            "LOCALAPPDATA": str(workspace / "AppData" / "Local"),
+            "XDG_CONFIG_HOME": str(config_home),
+            "FAILOVER_IMAGEGEN_TOOL_CONFIG": str(config_home / "failover-imagegen-tool" / "config.json"),
+            "FAILOVER_IMAGEGEN_JOBS_DIR": str(workspace / "jobs"),
         })
         self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(self._close_gui)
         config = Path(app.appdata_config())
+        # Verify isolation before touching any config, on every host platform.
+        self.assertTrue(config.resolve().is_relative_to(workspace.resolve()))
+        self.assertEqual(str(config), app.engine_env()["FAILOVER_IMAGEGEN_TOOL_CONFIG"])
         config.parent.mkdir(parents=True, exist_ok=True)
         self.source = {"name": "测试源名称特别长" * 6, "base_url": "http://127.0.0.1:9/v1",
                        "api_key": "test-secret", "models": ["gpt-image-2", "模型名称特别长" * 8],
                        "supported_sizes": ["1024x1024"], "size_strategy": "omit"}
         config.write_text(json.dumps({"version": 1, "sources": [self.source]}), encoding="utf-8")
         self.gui = app.cmd_gui(run_loop=False)
+        self.assertTrue(Path(self.gui.tasks.jobs_dir).resolve().is_relative_to(workspace.resolve()))
+        self.assertEqual(self.gui.tasks.records(), [], "task history leaked from another test")
         self.gui.geometry("880x640+0+0")
+        self.gui.update()
+        # Synthetic keyboard events are discarded by Tk when another desktop
+        # application owns focus. Exercise keys with this test window active.
+        self.gui.focus_force()
         self.gui.update()
 
     def relay(self, delay=0.2, fail=False):
@@ -216,13 +266,16 @@ class NativeWorkflowTests(unittest.TestCase):
             "items": [{"id": "1", "status": state, "prompt": prompt}], "size": [1024, 1024],
             "options": {"model": "gpt-image-2"}})
 
-    def tearDown(self):
+    def _close_gui(self):
         if getattr(self, "gui", None):
             if hasattr(self.gui, "tasks"):
                 self.gui.tasks.close()
             self.gui.destroy()
-        self.env.stop()
-        self.temp.cleanup()
+            self.gui = None
+
+    def tearDown(self):
+        # Also used directly by isolated lifecycle/screenshot scenarios.
+        self.doCleanups()
 
     def test_history_navigation_and_test_dialog_work_at_minimum_size(self):
         self.assertIn("history", self.gui.pages, "persistent task history page missing")
