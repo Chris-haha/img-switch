@@ -258,6 +258,36 @@ class NativeWorkflowTests(unittest.TestCase):
             time.sleep(0.015)
         self.fail("timed out waiting for GUI state")
 
+    def assert_task_status(self, task_id, expected, server=None):
+        task = self.gui.tasks.get(task_id)
+        process = self.gui.tasks.processes.get(task_id)
+        evidence = {
+            "expected_status": expected,
+            "task": task,
+            "process_returncode": process.poll() if process is not None else None,
+            "engine_output": self.gui.tasks.logs.get(task_id, ""),
+            "cancellation": self.gui.tasks.cancellation(task_id),
+            "relay_request_count": len(server.requests) if server is not None else None,
+            "relay_requests": server.requests if server is not None else [],
+        }
+        diagnostic = self.gui.safe_text(json.dumps(evidence, ensure_ascii=False, indent=2), 30000)
+        self.assertIsNotNone(task, diagnostic)
+        self.assertEqual(task["status"], expected, diagnostic)
+
+    def test_task_status_failure_reports_persistence_error_and_process_evidence(self):
+        task = self.seed("unknown")
+        task["items"][0]["error"] = "simulated persistence sharing violation"
+        self.gui.task_store().save_task(self.gui.tasks.jobs_dir, task)
+        self.gui.tasks.logs[task["id"]] = "simulated engine traceback: WinError 32"
+        with self.assertRaises(AssertionError) as captured:
+            self.assert_task_status(task["id"], "succeeded")
+        message = str(captured.exception)
+        self.assertIn("simulated persistence sharing violation", message)
+        self.assertIn("simulated engine traceback: WinError 32", message)
+        self.assertIn('"process_returncode"', message)
+        self.assertIn('"relay_request_count"', message)
+        self.assertIn('"cancellation"', message)
+
     def seed(self, state, prompt="同名任务", created="2026-11-27T12:00:01+00:00"):
         store = self.gui.task_store()
         return store.create_task(self.gui.tasks.jobs_dir, {
@@ -434,11 +464,11 @@ class NativeWorkflowTests(unittest.TestCase):
         dialog.generate()
         self.wait_for(lambda: dialog.task_id not in self.gui.tasks.active_ids())
         task_id = dialog.task_id
-        self.assertEqual(self.gui.tasks.get(task_id)["status"], "failed")
+        self.assert_task_status(task_id, "failed", server)
         server.fail = False
         self.gui.pages["history"].retry(task_id)
         self.wait_for(lambda: task_id not in self.gui.tasks.active_ids())
-        self.assertEqual(self.gui.tasks.get(task_id)["status"], "succeeded")
+        self.assert_task_status(task_id, "succeeded", server)
         self.assertEqual(len(server.requests), 2)
         server.delay = 2
         dialog.generate()
@@ -446,13 +476,13 @@ class NativeWorkflowTests(unittest.TestCase):
         task_id = dialog.task_id
         dialog.cancel()
         self.wait_for(lambda: task_id not in self.gui.tasks.active_ids())
-        self.assertEqual(self.gui.tasks.get(task_id)["status"], "unknown")
+        self.assert_task_status(task_id, "unknown", server)
         server.delay = 0.01
         with mock.patch("gui_tasks.messagebox.askyesno", return_value=True) as confirmation:
             self.gui.pages["history"].retry(task_id)
         confirmation.assert_called_once()
         self.wait_for(lambda: task_id not in self.gui.tasks.active_ids())
-        self.assertEqual(self.gui.tasks.get(task_id)["status"], "succeeded")
+        self.assert_task_status(task_id, "succeeded", server)
         self.assertEqual(len(server.requests), 4)
         dialog.close()
 

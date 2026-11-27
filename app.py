@@ -610,6 +610,7 @@ def cmd_gui(*, run_loop=True):
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
     from tk_lifecycle import ManagedTk
+    from failovercfg import shared_read
 
     # ccswitch 风格设计系统：浅灰底 + 白卡片 + 橙色主按钮 + 绿色状态色
     C = {
@@ -691,7 +692,7 @@ def cmd_gui(*, run_loop=True):
     def failover_now():
         """读 config.json 顶层 failover（默认 True）。"""
         try:
-            with open(appdata_config(), "r", encoding="utf-8") as f:
+            with shared_read(appdata_config()) as f:
                 return bool(json.load(f).get("failover", True))
         except (OSError, ValueError):
             return True

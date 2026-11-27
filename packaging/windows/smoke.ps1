@@ -25,17 +25,24 @@ function Invoke-CheckedProcess([string]$FilePath, [string[]]$Arguments, [string]
         $options.RedirectStandardError = $LogPrefix + '-stderr.txt'
     }
     $process = Start-Process @options
+    # Windows PowerShell 5.1 must retain the handle before waiting when streams
+    # are redirected, otherwise ExitCode can be null after a successful exit.
+    # https://github.com/PowerShell/PowerShell/issues/5421
+    $null = $process.Handle
     if (!$process.WaitForExit(120000)) {
         & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $process.Id /T /F | Out-Null
         throw "Process timed out: $FilePath"
     }
-    $process.Refresh()
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $process.Dispose()
     if ($LogPrefix) {
         foreach ($path in @($options.RedirectStandardOutput, $options.RedirectStandardError)) {
             if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Encoding UTF8 | Write-Output }
         }
     }
-    if ($process.ExitCode -ne 0) { throw "Process failed with exit code $($process.ExitCode): $FilePath" }
+    if ($null -eq $exitCode) { throw "Process exit code unavailable: $FilePath" }
+    if ($exitCode -ne 0) { throw "Process failed with exit code ${exitCode}: $FilePath" }
 }
 foreach ($name in @('APPDATA','FAILOVER_IMAGEGEN_APP_HOME','FAILOVER_IMAGEGEN_TOOL_CONFIG',
         'FAILOVER_IMAGEGEN_JOBS_DIR','FAILOVER_IMAGEGEN_APP_SMOKE','FAILOVER_IMAGEGEN_APP_SELFTEST',

@@ -523,6 +523,70 @@ class EngineJobTests(unittest.TestCase):
                 with task_store.task_lock(str(self.jobs), ident):
                     pass
 
+    def test_shared_read_keeps_snapshot_while_atomic_replace_updates_path(self):
+        self.assertTrue(hasattr(failovercfg, 'shared_read'),
+                        'persistent JSON readers must permit atomic replacement')
+        path = self.work / 'snapshot.json'
+        original, updated = b'{"value": "before"}', b'{"value": "after"}'
+        path.write_bytes(original)
+        with failovercfg.shared_read(path) as reader:
+            failovercfg.atomic_write(str(path), updated)
+            self.assertEqual(reader.read(), original)
+            self.assertEqual(path.read_bytes(), updated)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows native read/delete sharing semantics')
+    def test_windows_plain_reader_blocks_replace_but_task_reader_does_not(self):
+        import task_store
+        path = self.work / 'plain-reader.json'
+        original = b'{"value": "before"}'
+        path.write_bytes(original)
+        # Native before-case: the former ordinary read handle denies replacement.
+        with open(path, 'rb'):
+            with self.assertRaises(PermissionError) as conflict:
+                failovercfg.atomic_write(str(path), b'{"value": "after"}')
+            self.assertIn(conflict.exception.winerror, (5, 32))
+            self.assertEqual(path.read_bytes(), original)
+
+        ident = str(uuid.uuid4())
+        record = task_store.create_task(str(self.jobs), {
+            'id': ident, 'name': 'before', 'status': 'queued', 'sources': [],
+            'items': [{'id': '1', 'status': 'queued', 'prompt': 'local fixture'}]})
+        opened, release = threading.Event(), threading.Event()
+        results, failures = [], []
+        shared_read = failovercfg.shared_read
+        reader_thread = None
+
+        @contextlib.contextmanager
+        def hold_reader(filename):
+            with shared_read(filename) as stream:
+                if threading.current_thread() is reader_thread:
+                    opened.set()
+                    if not release.wait(4):
+                        raise RuntimeError('test writer did not finish')
+                yield stream
+
+        def read_task():
+            try:
+                results.append(task_store.load_task(str(self.jobs), ident))
+            except Exception as error:
+                failures.append(error)
+
+        with mock.patch.object(failovercfg, 'shared_read', hold_reader):
+            reader_thread = threading.Thread(target=read_task)
+            reader_thread.start()
+            try:
+                self.assertTrue(opened.wait(3), 'reader did not acquire its real Windows handle')
+                record['name'] = 'after'
+                task_store.save_task(str(self.jobs), record)
+            finally:
+                release.set()
+                reader_thread.join(5)
+        self.assertFalse(reader_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results[0]['name'], 'before')
+        self.assertEqual(task_store.load_task(str(self.jobs), ident)['name'], 'after')
+        self.assertEqual(self.server.requests, [], 'journal replacement must not generate an image')
+
 
 if __name__ == '__main__':
     unittest.main()

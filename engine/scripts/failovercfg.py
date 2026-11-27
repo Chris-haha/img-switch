@@ -96,6 +96,46 @@ class Config(dict):
     """A loaded document carries its revision without serializing it to JSON."""
 
 
+def shared_read(path):
+    """Open a binary snapshot without blocking atomic rename on Windows.
+
+    The CRT's ordinary open() shares read/write access but not deletion, which
+    also covers rename. A GUI history reader must permit an engine's os.replace
+    while keeping its own consistent handle to the previous file contents.
+    """
+    if os.name != "nt":
+        return open(path, "rb")
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                           wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    # GENERIC_READ; SHARE_READ | SHARE_WRITE | SHARE_DELETE; OPEN_EXISTING.
+    # No DELETE access, DELETE_ON_CLOSE flag, or inheritable handle is requested.
+    handle = create_file(os.fsdecode(path), 0x80000000, 0x1 | 0x2 | 0x4,
+                         None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        close_handle(handle)
+        raise
+    try:
+        return os.fdopen(fd, "rb")  # The returned stream now owns the handle.
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def atomic_write(path, data):
     """Replace a file using a private, unique temporary file in its directory."""
     parent = os.path.dirname(os.path.abspath(path))
@@ -150,7 +190,7 @@ def load_config(path=None):
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "rb") as f:
+        with shared_read(path) as f:
             raw = f.read()
         cfg = json.loads(raw)
     except (OSError, ValueError) as e:
@@ -182,7 +222,7 @@ def _save_config_locked(cfg, path):
         raise RuntimeError("配置已被其他窗口修改，请重新打开后再保存；原文件已保留")
     data = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if current is not None:
-        with open(path, "rb") as f:
+        with shared_read(path) as f:
             previous = f.read()
         if hashlib.sha256(previous).hexdigest() != current.revision:
             raise RuntimeError("配置在保存前发生变化，请重新打开后再保存")

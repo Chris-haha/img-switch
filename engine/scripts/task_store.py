@@ -76,8 +76,9 @@ def _validate(record, task_id):
 def load_task(directory, task_id):
     path = _path(directory, task_id)
     try:
-        with open(path, encoding='utf-8') as stream:
-            record = json.load(stream)
+        with failovercfg.shared_read(path) as stream:
+            raw = stream.read()
+        record = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise RuntimeError('无法读取任务 %s: %s' % (task_id, type(exc).__name__)) from None
     return _validate(record, task_id)

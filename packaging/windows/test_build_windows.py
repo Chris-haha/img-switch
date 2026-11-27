@@ -14,6 +14,43 @@ from pathlib import Path
 PATH = Path(__file__).resolve().with_name('build_windows.py')
 
 class BuildTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'requires native Windows PowerShell 5.1')
+    def test_smoke_runner_preserves_process_exit_codes_and_redirected_output(self):
+        with tempfile.TemporaryDirectory(prefix='img-switch-process-') as directory:
+            work = Path(directory)
+            child = work / 'child with spaces.py'
+            child.write_text("import sys, time\nprint('child stdout')\nprint('child stderr', file=sys.stderr)\ntime.sleep(0.1)\nsys.exit(int(sys.argv[1]))\n", encoding='utf-8')
+            script = work / 'check.ps1'
+            quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+            # Parse only the production helper; never run the installer smoke body.
+            script.write_text("""$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'This regression requires Windows PowerShell 5.1' }
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(SMOKE_PATH, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+$helper = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-CheckedProcess' }, $true)
+if ($null -eq $helper) { throw 'Smoke process helper missing' }
+Invoke-Expression $helper.Extent.Text
+Invoke-CheckedProcess PYTHON_PATH @('-B', CHILD_ARGUMENT, '0') SUCCESS_LOG
+$failure = ''
+try { Invoke-CheckedProcess PYTHON_PATH @('-B', CHILD_ARGUMENT, '7') FAILURE_LOG }
+catch { $failure = $_.Exception.Message }
+if ($failure -notlike 'Process failed with exit code 7:*') { throw ('Incorrect failure exit: ' + $failure) }
+Write-Output 'Verified actual process exit codes 0 and 7'
+""".replace('SMOKE_PATH', quote(PATH.with_name('smoke.ps1')))
+                .replace('PYTHON_PATH', quote(sys.executable))
+                .replace('CHILD_ARGUMENT', quote('"' + str(child) + '"'))
+                .replace('SUCCESS_LOG', quote(work / 'success'))
+                .replace('FAILURE_LOG', quote(work / 'failure')), encoding='utf-8')
+            result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script)],
+                                    capture_output=True, text=True, errors='replace', timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('Verified actual process exit codes 0 and 7', result.stdout)
+            for label in ('success', 'failure'):
+                for stream in ('stdout', 'stderr'):
+                    self.assertEqual((work / (label + '-' + stream + '.txt')).read_text(encoding='utf-8-sig').strip(), 'child ' + stream)
+
     def test_inno_inputs_remain_absolute_when_ci_uses_relative_script_entry(self):
         root = Path(__file__).resolve().parents[2]
         script = "import runpy; print(runpy.run_path('packaging/windows/test_build_windows.py')['PATH'])"
